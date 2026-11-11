@@ -19,11 +19,13 @@ FETCH_TIMEOUT = 15
 MAX_LINES = 20000
 
 XRAY_BIN = os.environ.get("XRAY_BIN", "./xray")
-CHECK_CONCURRENCY = int(os.environ.get("CHECK_CONCURRENCY", "60"))
+CHECK_CONCURRENCY = int(os.environ.get("CHECK_CONCURRENCY", "40"))
+PRE_FILTER_CONCURRENCY = 250
+TCP_PRE_TIMEOUT = 1.2
+
 TEST_URL = "https://www.gstatic.com/generate_204"
 CURL_TIMEOUT = 4
-XRAY_STARTUP_WAIT = 0.3
-TCP_PING_TIMEOUT = 1.2
+XRAY_STARTUP_WAIT = 0.35
 
 
 # ---------- Сбор источников ----------
@@ -168,6 +170,25 @@ def parse_config(line):
     return None
 
 
+# ---------- Предварительный TCP-фильтр и вспомогательные функции ----------
+
+def get_free_port():
+    """Находит свободный случайный порт в ОС."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def fast_tcp_check(item):
+    """Быстрый сокет-чек доступности хоста/порта перед запуском тяжелого Xray."""
+    _, parsed = item
+    try:
+        with socket.create_connection((parsed["address"], int(parsed["port"])), timeout=TCP_PRE_TIMEOUT):
+            return item, True
+    except Exception:
+        return item, False
+
+
 # ---------- Сборка xray-конфига и живая проверка ----------
 
 def build_xray_config(p, socks_port):
@@ -241,32 +262,11 @@ def build_xray_config(p, socks_port):
     }
 
 
-def get_free_port():
-    """Выделяет гарантированно свободный порт через ядро ОС."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def tcp_ping(host, port, timeout=TCP_PING_TIMEOUT):
-    """Быстрый пречек: отсекает мертвые серверы до запуска тяжелого Xray."""
-    try:
-        with socket.create_connection((host, int(port)), timeout=timeout):
-            return True
-    except Exception:
-        return False
-
-
 def check_config(parsed):
-    # Если хост лежит по TCP, не тратим ресурсы на запуск Xray
-    if not tcp_ping(parsed["address"], parsed["port"]):
-        return False
-
     socks_port = get_free_port()
     config = build_xray_config(parsed, socks_port)
     config_path = None
     proc = None
-
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(config, f)
@@ -286,20 +286,22 @@ def check_config(parsed):
                 "--socks5-hostname", f"127.0.0.1:{socks_port}",
                 TEST_URL,
             ],
-            capture_output=True,
-            text=True,
-            timeout=CURL_TIMEOUT + 1,
+            capture_output=True, text=True, timeout=CURL_TIMEOUT + 2,
         )
         return result.stdout.strip() in ("204", "200")
     except Exception:
         return False
     finally:
         if proc is not None:
-            proc.kill()
             try:
-                proc.wait(timeout=0.5)
+                proc.terminate()
+                proc.wait(timeout=1)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
         if config_path:
             try:
                 os.remove(config_path)
@@ -326,10 +328,10 @@ def main():
 
     total_collected = len(all_lines)
 
+    # Дедупликация
     seen = set()
     candidates = []
     dropped_unparsed = 0
-
     for line in all_lines:
         parsed = parse_config(line)
         if parsed is None:
@@ -339,35 +341,50 @@ def main():
         if key in seen:
             continue
         seen.add(key)
-        # Сохраняем связку: распарсенная структура + исходная валидная строка
-        candidates.append((parsed, line))
+        candidates.append((line, parsed))
 
     print("----")
     print(f"Источников: {len(urls)}, ошибок загрузки: {len(errors)}")
     print(f"Собрано всего строк: {total_collected}")
     print(f"Отброшено нераспарсенных: {dropped_unparsed}")
     print(f"Уникальных кандидатов после дедупа: {len(candidates)}")
-    print(f"Проверка через xray ({len(candidates)} шт., параллельность {CHECK_CONCURRENCY})…")
 
-    def worker(item):
-        parsed, raw_line = item
-        ok = check_config(parsed)
-        return raw_line, ok
+    # 1 этап: Быстрый TCP-фильтр (отсев мертвых серверов без запуска Xray)
+    print(f"Быстрый TCP-фильтр ({len(candidates)} кандидатов, потоков: {PRE_FILTER_CONCURRENCY})...")
+    live_candidates = []
+    tcp_checked = 0
+    with ThreadPoolExecutor(max_workers=PRE_FILTER_CONCURRENCY) as pre_exec:
+        futures = [pre_exec.submit(fast_tcp_check, c) for c in candidates]
+        for f in as_completed(futures):
+            item, is_alive = f.result()
+            tcp_checked += 1
+            if is_alive:
+                live_candidates.append(item)
+            if tcp_checked % 10000 == 0 or tcp_checked == len(candidates):
+                print(f"  TCP чек: {tcp_checked}/{len(candidates)}, доступно по порту: {len(live_candidates)}")
+
+    print(f"Живых хостов для полной проверки: {len(live_candidates)} из {len(candidates)}")
+
+    # 2 этап: Полная проверка через Xray только для живых хостов
+    print(f"Проверка через xray ({len(live_candidates)} шт., параллельность {CHECK_CONCURRENCY})...")
 
     working_lines = []
     checked = 0
-
     with ThreadPoolExecutor(max_workers=CHECK_CONCURRENCY) as executor:
-        futures = [executor.submit(worker, c) for c in candidates]
-        for future in as_completed(futures):
-            raw_line, ok = future.result()
+        future_map = {executor.submit(check_config, parsed): line for line, parsed in live_candidates}
+        for future in as_completed(future_map):
+            line = future_map[future]
             checked += 1
+            try:
+                ok = future.result()
+            except Exception:
+                ok = False
             if ok:
-                working_lines.append(raw_line)
-            if checked % 500 == 0 or checked == len(candidates):
-                print(f"  проверено {checked}/{len(candidates)}, рабочих пока {len(working_lines)}")
+                working_lines.append(line)
+            if checked % 100 == 0 or checked == len(live_candidates):
+                print(f"  Xray чек: {checked}/{len(live_candidates)}, рабочих: {len(working_lines)}")
 
-    print(f"Рабочих серверов: {len(working_lines)} из {len(candidates)}")
+    print(f"Рабочих серверов: {len(working_lines)} из {len(live_candidates)}")
 
     truncated = len(working_lines) > MAX_LINES
     final_lines = working_lines[:MAX_LINES] if truncated else working_lines
@@ -388,4 +405,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
