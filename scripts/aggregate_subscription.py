@@ -16,14 +16,16 @@ PLAIN_OUT = f"{OUT_DIR}/aggregated.txt"
 BASE64_OUT = f"{OUT_DIR}/aggregated_base64.txt"
 FETCH_TIMEOUT = 12
 
-MAX_LINES = 20000
+MAX_LINES = 1000
 
 XRAY_BIN = os.environ.get("XRAY_BIN", "./xray")
 CHECK_CONCURRENCY = int(os.environ.get("CHECK_CONCURRENCY", "40"))
-PRE_FILTER_CONCURRENCY = 250
+PRE_FILTER_CONCURRENCY = 150
 TCP_PRE_TIMEOUT = 1.2
 
-TEST_URL = "https://www.gstatic.com/generate_204"
+# Проверяем через ресурс, заблокированный у операторов РФ,
+# чтобы исключить серверы, не обходящие ТСПУ.
+TEST_URL = "https://www.instagram.com"
 CURL_TIMEOUT = 4
 XRAY_STARTUP_WAIT = 0.35
 
@@ -56,7 +58,7 @@ def scan_lines(text):
     found = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if line.startswith("vless://") or line.startswith("vmess://"):
+        if line.startswith("vless://"):
             found.append(line)
     return found
 
@@ -71,7 +73,11 @@ def extract_configs(raw_text):
     return scan_lines(decoded)
 
 
-def parse_vless(line):
+def parse_vless_reality(line):
+    """
+    Разбирает только VLESS + Reality конфигурации.
+    Все остальные протоколы отсекаются, так как они глушатся ТСПУ.
+    """
     try:
         body = line[len("vless://"):].split("#", 1)[0]
         parsed = urllib.parse.urlparse("vless://" + body)
@@ -87,17 +93,24 @@ def parse_vless(line):
             v = qs.get(name)
             return v[0] if v else default
 
+        security = q("security", "").lower()
+        pbk = q("pbk")
+
+        # Жесткий фильтр: пропускаем исключительно REALITY с валидным ключом
+        if security != "reality" or not pbk:
+            return None
+
         return {
             "protocol": "vless",
             "address": host,
-            "port": port,
+            "port": int(port),
             "id": uuid,
             "flow": q("flow"),
             "network": q("type", "tcp") or "tcp",
-            "security": q("security", "none") or "none",
+            "security": "reality",
             "sni": q("sni") or q("peer") or host,
             "fp": q("fp") or "chrome",
-            "pbk": q("pbk"),
+            "pbk": pbk,
             "sid": q("sid"),
             "spx": q("spx"),
             "path": q("path", "/") or "/",
@@ -107,54 +120,6 @@ def parse_vless(line):
         }
     except Exception:
         return None
-
-
-def parse_vmess(line):
-    try:
-        payload = line[len("vmess://"):].split("#", 1)[0]
-        padding = len(payload) % 4
-        if padding:
-            payload += "=" * (4 - padding)
-        decoded = base64.b64decode(payload).decode("utf-8", errors="ignore")
-        data = json.loads(decoded)
-
-        host = data.get("add")
-        port = int(data.get("port", 0) or 0)
-        vid = data.get("id")
-        if not host or not port or not vid:
-            return None
-
-        net = data.get("net", "tcp") or "tcp"
-        is_tls = str(data.get("tls", "")).lower() == "tls"
-
-        return {
-            "protocol": "vmess",
-            "address": host,
-            "port": port,
-            "id": vid,
-            "aid": int(data.get("aid", 0) or 0),
-            "network": net,
-            "security": "tls" if is_tls else "none",
-            "sni": data.get("sni") or data.get("host") or host,
-            "fp": "chrome",
-            "pbk": "",
-            "sid": "",
-            "spx": "",
-            "path": data.get("path", "/") or "/",
-            "host_header": data.get("host", "") or "",
-            "service_name": data.get("path", "") if net == "grpc" else "",
-            "alpn": data.get("alpn", "") or "",
-        }
-    except Exception:
-        return None
-
-
-def parse_config(line):
-    if line.startswith("vless://"):
-        return parse_vless(line)
-    if line.startswith("vmess://"):
-        return parse_vmess(line)
-    return None
 
 
 # ---------- 2. TCP Pre-check и порты ----------
@@ -174,66 +139,44 @@ def fast_tcp_check(item):
         return item, False
 
 
-# ---------- 3. Финальный тест через Xray ----------
+# ---------- 3. Тест через Xray ----------
 
 def build_xray_config(p, socks_port):
     stream = {
         "network": p["network"] or "tcp",
-        "security": p["security"] or "none",
-    }
-
-    if p["network"] == "ws":
-        stream["wsSettings"] = {
-            "path": p.get("path") or "/",
-            "headers": {"Host": p.get("host_header") or p.get("sni") or p["address"]},
-        }
-    elif p["network"] == "grpc":
-        stream["grpcSettings"] = {"serviceName": p.get("service_name") or ""}
-    elif p["network"] in ("h2", "http"):
-        stream["httpSettings"] = {
-            "path": p.get("path") or "/",
-            "host": [p.get("host_header") or p.get("sni") or p["address"]],
-        }
-
-    if p["security"] == "tls":
-        tls = {
-            "serverName": p.get("sni") or p["address"],
-            "allowInsecure": True,
-            "fingerprint": p.get("fp") or "chrome",
-        }
-        if p.get("alpn"):
-            tls["alpn"] = p["alpn"].split(",")
-        stream["tlsSettings"] = tls
-    elif p["security"] == "reality":
-        stream["realitySettings"] = {
+        "security": "reality",
+        "realitySettings": {
             "serverName": p.get("sni") or p["address"],
             "fingerprint": p.get("fp") or "chrome",
             "publicKey": p.get("pbk") or "",
             "shortId": p.get("sid") or "",
             "spiderX": p.get("spx") or "",
+        },
+    }
+
+    if p["network"] == "grpc":
+        stream["grpcSettings"] = {"serviceName": p.get("service_name") or ""}
+    elif p["network"] == "ws":
+        stream["wsSettings"] = {
+            "path": p.get("path") or "/",
+            "headers": {"Host": p.get("host_header") or p.get("sni") or p["address"]},
         }
 
-    if p["protocol"] == "vless":
-        user = {"id": p["id"], "encryption": "none"}
-        if p.get("flow"):
-            user["flow"] = p["flow"]
-        outbound = {
-            "protocol": "vless",
-            "settings": {"vnext": [{"address": p["address"], "port": p["port"], "users": [user]}]},
-            "streamSettings": stream,
-        }
-    else:
-        outbound = {
-            "protocol": "vmess",
-            "settings": {
-                "vnext": [{
-                    "address": p["address"],
-                    "port": p["port"],
-                    "users": [{"id": p["id"], "alterId": p.get("aid", 0), "security": "auto"}],
-                }]
-            },
-            "streamSettings": stream,
-        }
+    user = {"id": p["id"], "encryption": "none"}
+    if p.get("flow"):
+        user["flow"] = p["flow"]
+
+    outbound = {
+        "protocol": "vless",
+        "settings": {
+            "vnext": [{
+                "address": p["address"],
+                "port": p["port"],
+                "users": [user]
+            }]
+        },
+        "streamSettings": stream,
+    }
 
     return {
         "log": {"loglevel": "none"},
@@ -273,7 +216,9 @@ def check_config(parsed):
             ],
             capture_output=True, text=True, timeout=CURL_TIMEOUT + 2,
         )
-        return result.stdout.strip() in ("204", "200")
+        code = result.stdout.strip()
+        # Если прокси отдает успешные коды или перенаправления (например, 200, 301, 302)
+        return code.isdigit() and int(code) in (200, 204, 301, 302, 307, 308)
     except Exception:
         return False
     finally:
@@ -294,7 +239,7 @@ def check_config(parsed):
                 pass
 
 
-# ---------- Основной рабочий цикл ----------
+# ---------- Основной сценарий ----------
 
 def main():
     if not os.path.exists(SOURCES_FILE):
@@ -321,24 +266,28 @@ def main():
                 errors += 1
                 print(f"ERR           {u} -> {e}", flush=True)
 
-    # Дедупликация
+    # Дедупликация с сохранением только VLESS + Reality
     seen = set()
     candidates = []
     for line in all_lines:
-        parsed = parse_config(line)
+        parsed = parse_vless_reality(line)
         if not parsed:
             continue
-        key = (parsed["protocol"], parsed["id"], parsed["address"].lower(), parsed["port"])
+        key = (parsed["id"], parsed["address"].lower(), parsed["port"])
         if key not in seen:
             seen.add(key)
             candidates.append((line, parsed))
 
     print("----", flush=True)
     print(f"Собрано сырых строк: {len(all_lines)}", flush=True)
-    print(f"Уникальных валидных кандидатов: {len(candidates)}", flush=True)
+    print(f"Отобрано валидных VLESS-Reality кандидатов: {len(candidates)}", flush=True)
 
-    # Этап 1: TCP фильтр
-    print(f"Этап 1: Быстрый TCP pre-check ({len(candidates)} хостов)...", flush=True)
+    if not candidates:
+        print("Подходящих VLESS-Reality серверов не найдено.", flush=True)
+        return
+
+    # 1. Быстрый сокет-фильтр
+    print(f"Этап 1: TCP pre-check ({len(candidates)} хостов)...", flush=True)
     live_candidates = []
     tcp_checked = 0
     with ThreadPoolExecutor(max_workers=PRE_FILTER_CONCURRENCY) as pre_exec:
@@ -348,11 +297,13 @@ def main():
             tcp_checked += 1
             if is_alive:
                 live_candidates.append(item)
-            if tcp_checked % 10000 == 0 or tcp_checked == len(candidates):
-                print(f"  TCP чек: {tcp_checked}/{len(candidates)} | Ответили: {len(live_candidates)}", flush=True)
+            if tcp_checked % 500 == 0 or tcp_checked == len(candidates):
+                print(f"  TCP чек: {tcp_checked}/{len(candidates)} | Доступно по порту: {len(live_candidates)}", flush=True)
 
-    # Этап 2: Проверка через Xray
-    print(f"Этап 2: Проверка через Xray ({len(live_candidates)} шт., параллельность {CHECK_CONCURRENCY})...", flush=True)
+    print(f"Живых хостов для Xray: {len(live_candidates)} из {len(candidates)}", flush=True)
+
+    # 2. Xray + Curl тест
+    print(f"Этап 2: Проверка через Xray на пробитие блокировок...", flush=True)
     working_lines = []
     xray_checked = 0
     with ThreadPoolExecutor(max_workers=CHECK_CONCURRENCY) as executor:
@@ -365,10 +316,10 @@ def main():
                     working_lines.append(line)
             except Exception:
                 pass
-            if xray_checked % 100 == 0 or xray_checked == len(live_candidates):
-                print(f"  Xray чек: {xray_checked}/{len(live_candidates)} | Рабочих: {len(working_lines)}", flush=True)
+            if xray_checked % 50 == 0 or xray_checked == len(live_candidates):
+                print(f"  Xray чек: {xray_checked}/{len(live_candidates)} | Реально рабочих: {len(working_lines)}", flush=True)
 
-    # Сохранение результатов для v2rayNG
+    # Сохранение результата
     final_lines = working_lines[:MAX_LINES]
     os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -379,7 +330,7 @@ def main():
     with open(BASE64_OUT, "w", encoding="utf-8") as f:
         f.write(b64)
 
-    print(f"Готово! В подписку записано серверов: {len(final_lines)}", flush=True)
+    print(f"Готово! В подписку v2rayNG записано серверов: {len(final_lines)}", flush=True)
 
 
 if __name__ == "__main__":
