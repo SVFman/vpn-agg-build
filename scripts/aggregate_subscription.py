@@ -14,7 +14,7 @@ SOURCES_FILE = "subscription-sources.txt"
 OUT_DIR = "subscription"
 PLAIN_OUT = f"{OUT_DIR}/aggregated.txt"
 BASE64_OUT = f"{OUT_DIR}/aggregated_base64.txt"
-FETCH_TIMEOUT = 15
+FETCH_TIMEOUT = 12
 
 MAX_LINES = 20000
 
@@ -28,35 +28,15 @@ CURL_TIMEOUT = 4
 XRAY_STARTUP_WAIT = 0.35
 
 
-# ---------- Сбор источников ----------
+# ---------- 1. Сбор и парсинг источников ----------
 
-def read_sources(path):
-    urls = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            urls.append(line)
-    return urls
-
-
-def fetch(url):
+def fetch_source(url):
     req = urllib.request.Request(
         url,
         headers={"User-Agent": "Mozilla/5.0 (GitHubActions) VpnAggregator/1.0"},
     )
     with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
         return resp.read().decode("utf-8", errors="ignore")
-
-
-def scan_lines(text):
-    found = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if line.startswith("vless://") or line.startswith("vmess://"):
-            found.append(line)
-    return found
 
 
 def try_base64_decode(content):
@@ -72,6 +52,15 @@ def try_base64_decode(content):
         return None
 
 
+def scan_lines(text):
+    found = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("vless://") or line.startswith("vmess://"):
+            found.append(line)
+    return found
+
+
 def extract_configs(raw_text):
     direct = scan_lines(raw_text)
     if direct:
@@ -81,8 +70,6 @@ def extract_configs(raw_text):
         return []
     return scan_lines(decoded)
 
-
-# ---------- Разбор vless/vmess в структуру для xray-конфига ----------
 
 def parse_vless(line):
     try:
@@ -170,17 +157,15 @@ def parse_config(line):
     return None
 
 
-# ---------- Предварительный TCP-фильтр и вспомогательные функции ----------
+# ---------- 2. TCP Pre-check и порты ----------
 
 def get_free_port():
-    """Находит свободный случайный порт в ОС."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
 
 
 def fast_tcp_check(item):
-    """Быстрый сокет-чек доступности хоста/порта перед запуском тяжелого Xray."""
     _, parsed = item
     try:
         with socket.create_connection((parsed["address"], int(parsed["port"])), timeout=TCP_PRE_TIMEOUT):
@@ -189,7 +174,7 @@ def fast_tcp_check(item):
         return item, False
 
 
-# ---------- Сборка xray-конфига и живая проверка ----------
+# ---------- 3. Финальный тест через Xray ----------
 
 def build_xray_config(p, socks_port):
     stream = {
@@ -309,48 +294,51 @@ def check_config(parsed):
                 pass
 
 
-# ---------- Главный сценарий ----------
+# ---------- Основной рабочий цикл ----------
 
 def main():
-    urls = read_sources(SOURCES_FILE)
+    if not os.path.exists(SOURCES_FILE):
+        print(f"Файл {SOURCES_FILE} не найден!", flush=True)
+        return
+
+    with open(SOURCES_FILE, "r", encoding="utf-8") as f:
+        urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+    print(f"Параллельная загрузка {len(urls)} источников...", flush=True)
     all_lines = []
-    errors = {}
+    errors = 0
 
-    for url in urls:
-        try:
-            text = fetch(url)
-            lines = extract_configs(text)
-            all_lines.extend(lines)
-            print(f"OK  ({len(lines):6d}) {url}")
-        except Exception as e:
-            errors[url] = str(e)
-            print(f"ERR           {url} -> {e}")
-
-    total_collected = len(all_lines)
+    with ThreadPoolExecutor(max_workers=10) as fetcher:
+        futures = {fetcher.submit(fetch_source, u): u for u in urls}
+        for future in as_completed(futures):
+            u = futures[future]
+            try:
+                text = future.result()
+                lines = extract_configs(text)
+                all_lines.extend(lines)
+                print(f"OK  ({len(lines):6d}) {u}", flush=True)
+            except Exception as e:
+                errors += 1
+                print(f"ERR           {u} -> {e}", flush=True)
 
     # Дедупликация
     seen = set()
     candidates = []
-    dropped_unparsed = 0
     for line in all_lines:
         parsed = parse_config(line)
-        if parsed is None:
-            dropped_unparsed += 1
+        if not parsed:
             continue
         key = (parsed["protocol"], parsed["id"], parsed["address"].lower(), parsed["port"])
-        if key in seen:
-            continue
-        seen.add(key)
-        candidates.append((line, parsed))
+        if key not in seen:
+            seen.add(key)
+            candidates.append((line, parsed))
 
-    print("----")
-    print(f"Источников: {len(urls)}, ошибок загрузки: {len(errors)}")
-    print(f"Собрано всего строк: {total_collected}")
-    print(f"Отброшено нераспарсенных: {dropped_unparsed}")
-    print(f"Уникальных кандидатов после дедупа: {len(candidates)}")
+    print("----", flush=True)
+    print(f"Собрано сырых строк: {len(all_lines)}", flush=True)
+    print(f"Уникальных валидных кандидатов: {len(candidates)}", flush=True)
 
-    # 1 этап: Быстрый TCP-фильтр (отсев мертвых серверов без запуска Xray)
-    print(f"Быстрый TCP-фильтр ({len(candidates)} кандидатов, потоков: {PRE_FILTER_CONCURRENCY})...")
+    # Этап 1: TCP фильтр
+    print(f"Этап 1: Быстрый TCP pre-check ({len(candidates)} хостов)...", flush=True)
     live_candidates = []
     tcp_checked = 0
     with ThreadPoolExecutor(max_workers=PRE_FILTER_CONCURRENCY) as pre_exec:
@@ -361,46 +349,37 @@ def main():
             if is_alive:
                 live_candidates.append(item)
             if tcp_checked % 10000 == 0 or tcp_checked == len(candidates):
-                print(f"  TCP чек: {tcp_checked}/{len(candidates)}, доступно по порту: {len(live_candidates)}")
+                print(f"  TCP чек: {tcp_checked}/{len(candidates)} | Ответили: {len(live_candidates)}", flush=True)
 
-    print(f"Живых хостов для полной проверки: {len(live_candidates)} из {len(candidates)}")
-
-    # 2 этап: Полная проверка через Xray только для живых хостов
-    print(f"Проверка через xray ({len(live_candidates)} шт., параллельность {CHECK_CONCURRENCY})...")
-
+    # Этап 2: Проверка через Xray
+    print(f"Этап 2: Проверка через Xray ({len(live_candidates)} шт., параллельность {CHECK_CONCURRENCY})...", flush=True)
     working_lines = []
-    checked = 0
+    xray_checked = 0
     with ThreadPoolExecutor(max_workers=CHECK_CONCURRENCY) as executor:
         future_map = {executor.submit(check_config, parsed): line for line, parsed in live_candidates}
         for future in as_completed(future_map):
             line = future_map[future]
-            checked += 1
+            xray_checked += 1
             try:
-                ok = future.result()
+                if future.result():
+                    working_lines.append(line)
             except Exception:
-                ok = False
-            if ok:
-                working_lines.append(line)
-            if checked % 100 == 0 or checked == len(live_candidates):
-                print(f"  Xray чек: {checked}/{len(live_candidates)}, рабочих: {len(working_lines)}")
+                pass
+            if xray_checked % 100 == 0 or xray_checked == len(live_candidates):
+                print(f"  Xray чек: {xray_checked}/{len(live_candidates)} | Рабочих: {len(working_lines)}", flush=True)
 
-    print(f"Рабочих серверов: {len(working_lines)} из {len(live_candidates)}")
-
-    truncated = len(working_lines) > MAX_LINES
-    final_lines = working_lines[:MAX_LINES] if truncated else working_lines
-
+    # Сохранение результатов для v2rayNG
+    final_lines = working_lines[:MAX_LINES]
     os.makedirs(OUT_DIR, exist_ok=True)
 
     with open(PLAIN_OUT, "w", encoding="utf-8") as f:
         f.write("\n".join(final_lines))
 
-    joined = "\n".join(final_lines).encode("utf-8")
-    b64 = base64.b64encode(joined).decode("ascii")
+    b64 = base64.b64encode("\n".join(final_lines).encode("utf-8")).decode("ascii")
     with open(BASE64_OUT, "w", encoding="utf-8") as f:
         f.write(b64)
 
-    if truncated:
-        print(f"Обрезано до лимита: {MAX_LINES}")
+    print(f"Готово! В подписку записано серверов: {len(final_lines)}", flush=True)
 
 
 if __name__ == "__main__":
