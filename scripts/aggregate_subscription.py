@@ -2,7 +2,7 @@
 import base64
 import json
 import os
-import queue
+import socket
 import subprocess
 import tempfile
 import time
@@ -20,10 +20,10 @@ MAX_LINES = 20000
 
 XRAY_BIN = os.environ.get("XRAY_BIN", "./xray")
 CHECK_CONCURRENCY = int(os.environ.get("CHECK_CONCURRENCY", "60"))
-BASE_PORT = 20000
 TEST_URL = "https://www.gstatic.com/generate_204"
 CURL_TIMEOUT = 4
-XRAY_STARTUP_WAIT = 0.4
+XRAY_STARTUP_WAIT = 0.3
+TCP_PING_TIMEOUT = 1.2
 
 
 # ---------- Сбор источников ----------
@@ -241,10 +241,32 @@ def build_xray_config(p, socks_port):
     }
 
 
-def check_config(parsed, socks_port):
+def get_free_port():
+    """Выделяет гарантированно свободный порт через ядро ОС."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def tcp_ping(host, port, timeout=TCP_PING_TIMEOUT):
+    """Быстрый пречек: отсекает мертвые серверы до запуска тяжелого Xray."""
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def check_config(parsed):
+    # Если хост лежит по TCP, не тратим ресурсы на запуск Xray
+    if not tcp_ping(parsed["address"], parsed["port"]):
+        return False
+
+    socks_port = get_free_port()
     config = build_xray_config(parsed, socks_port)
     config_path = None
     proc = None
+
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(config, f)
@@ -264,18 +286,20 @@ def check_config(parsed, socks_port):
                 "--socks5-hostname", f"127.0.0.1:{socks_port}",
                 TEST_URL,
             ],
-            capture_output=True, text=True, timeout=CURL_TIMEOUT + 3,
+            capture_output=True,
+            text=True,
+            timeout=CURL_TIMEOUT + 1,
         )
         return result.stdout.strip() in ("204", "200")
     except Exception:
         return False
     finally:
         if proc is not None:
-            proc.terminate()
+            proc.kill()
             try:
-                proc.wait(timeout=2)
+                proc.wait(timeout=0.5)
             except Exception:
-                proc.kill()
+                pass
         if config_path:
             try:
                 os.remove(config_path)
@@ -302,12 +326,10 @@ def main():
 
     total_collected = len(all_lines)
 
-    # Парсим + дедуплицируем по host+port+id, но храним ОРИГИНАЛЬНУЮ строку
-    # целиком (с её tls/sni/reality/ws-параметрами) — именно её и нужно
-    # отдавать на выходе, а не восстановленную вручную урезанную версию.
     seen = set()
-    candidates = []  # list of (original_line, parsed_dict)
+    candidates = []
     dropped_unparsed = 0
+
     for line in all_lines:
         parsed = parse_config(line)
         if parsed is None:
@@ -317,7 +339,8 @@ def main():
         if key in seen:
             continue
         seen.add(key)
-        candidates.append((line, parsed))
+        # Сохраняем связку: распарсенная структура + исходная валидная строка
+        candidates.append((parsed, line))
 
     print("----")
     print(f"Источников: {len(urls)}, ошибок загрузки: {len(errors)}")
@@ -326,31 +349,21 @@ def main():
     print(f"Уникальных кандидатов после дедупа: {len(candidates)}")
     print(f"Проверка через xray ({len(candidates)} шт., параллельность {CHECK_CONCURRENCY})…")
 
-    port_pool = queue.Queue()
-    for p in range(BASE_PORT, BASE_PORT + CHECK_CONCURRENCY * 2):
-        port_pool.put(p)
-
     def worker(item):
-        line, parsed = item
-        port = port_pool.get()
-        try:
-            ok = check_config(parsed, port)
-        finally:
-            port_pool.put(port)
-        return line, ok
+        parsed, raw_line = item
+        ok = check_config(parsed)
+        return raw_line, ok
 
     working_lines = []
     checked = 0
+
     with ThreadPoolExecutor(max_workers=CHECK_CONCURRENCY) as executor:
         futures = [executor.submit(worker, c) for c in candidates]
         for future in as_completed(futures):
-            line, ok = future.result()
+            raw_line, ok = future.result()
             checked += 1
             if ok:
-                # Сохраняем оригинальную строку как есть — со всеми
-                # параметрами (security, sni, flow, pbk и т.д.), иначе
-                # v2rayNG не сможет подключиться по урезанному адресу.
-                working_lines.append(line)
+                working_lines.append(raw_line)
             if checked % 500 == 0 or checked == len(candidates):
                 print(f"  проверено {checked}/{len(candidates)}, рабочих пока {len(working_lines)}")
 
@@ -375,43 +388,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    nes = []
-    checked = 0
-    with ThreadPoolExecutor(max_workers=CHECK_CONCURRENCY) as executor:
-        futures = [executor.submit(worker, c) for c in candidates]
-        for future in as_completed(futures):
-            parsed, ok = future.result()
-            checked += 1
-            if ok:
-                # Восстанавливаем исходную ссылку в простом виде, без remark —
-                # этого достаточно, чтобы v2rayNG подключился.
-                if parsed["protocol"] == "vless":
-                    line = f"vless://{parsed['id']}@{parsed['address']}:{parsed['port']}"
-                else:
-                    line = f"vmess://{parsed['id']}@{parsed['address']}:{parsed['port']}"
-                working_lines.append((parsed, line))
-            if checked % 500 == 0 or checked == len(candidates):
-                print(f"  проверено {checked}/{len(candidates)}, рабочих пока {len(working_lines)}")
-
-    print(f"Рабочих серверов: {len(working_lines)} из {len(candidates)}")
-
-    truncated = len(working_lines) > MAX_LINES
-    final = working_lines[:MAX_LINES] if truncated else working_lines
-    final_lines = [line for _, line in final]
-
-    os.makedirs(OUT_DIR, exist_ok=True)
-
-    with open(PLAIN_OUT, "w", encoding="utf-8") as f:
-        f.write("\n".join(final_lines))
-
-    joined = "\n".join(final_lines).encode("utf-8")
-    b64 = base64.b64encode(joined).decode("ascii")
-    with open(BASE64_OUT, "w", encoding="utf-8") as f:
-        f.write(b64)
-
-    if truncated:
-        print(f"Обрезано до лимита: {MAX_LINES}")
-
-
-if __name__ == "__main__":
-    main()
+        
