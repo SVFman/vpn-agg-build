@@ -8,9 +8,14 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: update-subscription
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -18,11 +23,21 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run aggregator
+      - name: Install xray-core
+        run: |
+          curl -sL -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          mkdir -p xray-bin
+          unzip -q xray.zip -d xray-bin
+          chmod +x xray-bin/xray
+
+      - name: Run aggregator with live check
+        env:
+          XRAY_BIN: ${{ github.workspace }}/xray-bin/xray
+          CHECK_CONCURRENCY: '60'
         run: python scripts/aggregate_subscription.py
 
       - name: Commit and push if changed
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Auto-update subscription list"
+          commit_message: "Auto-update subscription list (live-checked)"
           file_pattern: subscription/*.txt
