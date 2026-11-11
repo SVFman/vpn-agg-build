@@ -302,10 +302,11 @@ def main():
 
     total_collected = len(all_lines)
 
-    # Парсим + дедуплицируем по host+port+id.
-    # Нераспарсенные строки (битый формат) отбрасываем сразу — как и решили.
+    # Парсим + дедуплицируем по host+port+id, но храним ОРИГИНАЛЬНУЮ строку
+    # целиком (с её tls/sni/reality/ws-параметрами) — именно её и нужно
+    # отдавать на выходе, а не восстановленную вручную урезанную версию.
     seen = set()
-    candidates = []
+    candidates = []  # list of (original_line, parsed_dict)
     dropped_unparsed = 0
     for line in all_lines:
         parsed = parse_config(line)
@@ -316,7 +317,7 @@ def main():
         if key in seen:
             continue
         seen.add(key)
-        candidates.append(parsed)
+        candidates.append((line, parsed))
 
     print("----")
     print(f"Источников: {len(urls)}, ошибок загрузки: {len(errors)}")
@@ -329,15 +330,52 @@ def main():
     for p in range(BASE_PORT, BASE_PORT + CHECK_CONCURRENCY * 2):
         port_pool.put(p)
 
-    def worker(parsed):
+    def worker(item):
+        line, parsed = item
         port = port_pool.get()
         try:
             ok = check_config(parsed, port)
         finally:
             port_pool.put(port)
-        return parsed, ok
+        return line, ok
 
     working_lines = []
+    checked = 0
+    with ThreadPoolExecutor(max_workers=CHECK_CONCURRENCY) as executor:
+        futures = [executor.submit(worker, c) for c in candidates]
+        for future in as_completed(futures):
+            line, ok = future.result()
+            checked += 1
+            if ok:
+                # Сохраняем оригинальную строку как есть — со всеми
+                # параметрами (security, sni, flow, pbk и т.д.), иначе
+                # v2rayNG не сможет подключиться по урезанному адресу.
+                working_lines.append(line)
+            if checked % 500 == 0 or checked == len(candidates):
+                print(f"  проверено {checked}/{len(candidates)}, рабочих пока {len(working_lines)}")
+
+    print(f"Рабочих серверов: {len(working_lines)} из {len(candidates)}")
+
+    truncated = len(working_lines) > MAX_LINES
+    final_lines = working_lines[:MAX_LINES] if truncated else working_lines
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    with open(PLAIN_OUT, "w", encoding="utf-8") as f:
+        f.write("\n".join(final_lines))
+
+    joined = "\n".join(final_lines).encode("utf-8")
+    b64 = base64.b64encode(joined).decode("ascii")
+    with open(BASE64_OUT, "w", encoding="utf-8") as f:
+        f.write(b64)
+
+    if truncated:
+        print(f"Обрезано до лимита: {MAX_LINES}")
+
+
+if __name__ == "__main__":
+    main()
+    nes = []
     checked = 0
     with ThreadPoolExecutor(max_workers=CHECK_CONCURRENCY) as executor:
         futures = [executor.submit(worker, c) for c in candidates]
