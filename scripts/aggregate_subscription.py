@@ -9,6 +9,11 @@ PLAIN_OUT = f"{OUT_DIR}/aggregated.txt"
 BASE64_OUT = f"{OUT_DIR}/aggregated_base64.txt"
 TIMEOUT = 15
 
+# Жёсткий потолок на итоговое число строк: GitHub не принимает файлы
+# больше 100 МБ, а список на сотни тысяч серверов всё равно бесполезен
+# на практике (v2rayNG не тестирует их осмысленно, большинство нерабочие).
+MAX_LINES = 20000
+
 
 def read_sources(path):
     urls = []
@@ -72,20 +77,23 @@ def main():
             text = fetch(url)
             lines = extract_configs(text)
             all_lines.extend(lines)
-            print(f"OK  ({len(lines):5d}) {url}")
+            print(f"OK  ({len(lines):6d}) {url}")
         except Exception as e:
             errors[url] = str(e)
-            print(f"ERR          {url} -> {e}")
+            print(f"ERR           {url} -> {e}")
 
     total_collected = len(all_lines)
     deduped = list(dict.fromkeys(all_lines))
 
+    truncated = len(deduped) > MAX_LINES
+    final_lines = deduped[:MAX_LINES] if truncated else deduped
+
     os.makedirs(OUT_DIR, exist_ok=True)
 
     with open(PLAIN_OUT, "w", encoding="utf-8") as f:
-        f.write("\n".join(deduped))
+        f.write("\n".join(final_lines))
 
-    joined = "\n".join(deduped).encode("utf-8")
+    joined = "\n".join(final_lines).encode("utf-8")
     b64 = base64.b64encode(joined).decode("ascii")
     with open(BASE64_OUT, "w", encoding="utf-8") as f:
         f.write(b64)
@@ -93,6 +101,8 @@ def main():
     print("----")
     print(f"Источников: {len(urls)}, ошибок: {len(errors)}")
     print(f"Собрано всего: {total_collected}, после дедупа: {len(deduped)}")
+    if truncated:
+        print(f"Обрезано до лимита: {MAX_LINES}")
 
 
 if __name__ == "__main__":
