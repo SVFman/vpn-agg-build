@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import socket
+import ssl
 import subprocess
 import tempfile
 import time
@@ -20,13 +21,26 @@ FETCH_TIMEOUT = 12
 MAX_LINES = 20000
 
 XRAY_BIN = os.environ.get("XRAY_BIN", "./xray")
-CHECK_CONCURRENCY = int(os.environ.get("CHECK_CONCURRENCY", "40"))
-PRE_FILTER_CONCURRENCY = 200
-TCP_PRE_TIMEOUT = 1.2
+# Пункт 2: Увеличенная параллельность для спящих сетевых процессов
+CHECK_CONCURRENCY = int(os.environ.get("CHECK_CONCURRENCY", "70"))
+PRE_FILTER_CONCURRENCY = 250
+TCP_PRE_TIMEOUT = 1.0
+TLS_PRE_TIMEOUT = 1.2
 
-# Эталонная проверка доступности в v2rayNG
+# Пункт 1: Агрессивный таймаут для отсечения тормозящих прокси
 TEST_URL = "https://www.gstatic.com/generate_204"
-CURL_TIMEOUT = 4
+CURL_TIMEOUT = 2.5
+
+SUPPORTED_SCHEMES = (
+    "vless://",
+    "vmess://",
+    "trojan://",
+    "ss://",
+    "hy2://",
+    "hysteria2://",
+    "tuic://",
+    "wireguard://",
+)
 
 
 # ---------- 1. Сбор и парсинг источников ----------
@@ -53,23 +67,23 @@ def try_base64_decode(content):
         return None
 
 
-def scan_lines(text):
+def scan_lines(text, schemes):
     found = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if line.startswith("vless://"):
+        if line.startswith(schemes):
             found.append(line)
     return found
 
 
-def extract_configs(raw_text):
-    direct = scan_lines(raw_text)
+def extract_configs(raw_text, schemes=SUPPORTED_SCHEMES):
+    direct = scan_lines(raw_text, schemes)
     if direct:
         return direct
     decoded = try_base64_decode(raw_text)
     if decoded is None:
         return []
-    return scan_lines(decoded)
+    return scan_lines(decoded, schemes)
 
 
 def is_safe_address(host):
@@ -84,9 +98,6 @@ def is_safe_address(host):
 
 
 def parse_vless(line):
-    """
-    Разбирает VLESS URI с аккуратным извлечением всех параметров.
-    """
     try:
         body = line[len("vless://"):].split("#", 1)[0]
         parsed = urllib.parse.urlparse("vless://" + body)
@@ -127,7 +138,22 @@ def parse_vless(line):
         return None
 
 
-# ---------- 2. TCP Pre-check и порты ----------
+def make_dedup_key(line):
+    if line.startswith("vless://"):
+        parsed = parse_vless(line)
+        if parsed:
+            return (
+                "vless",
+                parsed["id"],
+                parsed["address"].lower(),
+                parsed["port"],
+                parsed["security"].lower(),
+                parsed["sni"].lower(),
+            )
+    return ("raw", line.split("#", 1)[0].strip())
+
+
+# ---------- 2. Быстрые сетевые фильтры (TCP + TLS Pre-check) ----------
 
 def get_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -136,10 +162,6 @@ def get_free_port():
 
 
 def wait_for_port(port, timeout=1.5):
-    """
-    Ожидает поднятия локального SOCKS-порта ядром Xray.
-    Устраняет race condition при старте процессов.
-    """
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
@@ -150,10 +172,32 @@ def wait_for_port(port, timeout=1.5):
     return False
 
 
-def fast_tcp_check(item):
+# Контекст для быстрого TLS handshake без проверки валидности сертификата
+TLS_CTX = ssl.create_default_context()
+TLS_CTX.check_hostname = False
+TLS_CTX.verify_mode = ssl.CERT_NONE
+
+
+def fast_socket_and_tls_check(item):
+    """
+    Пункт 3: Объединённый быстрый тест.
+    1. Проверяет доступность TCP-порта.
+    2. Если security == 'tls', сразу делает лёгкий TLS Handshake на сокетах Python,
+       отсеивая неработающие TLS-узлы без запуска бинарника Xray.
+       Reality и none пропускаются дальше напрямую в Xray.
+    """
     _, parsed = item
+    host = parsed["address"]
+    port = int(parsed["port"])
+    sec = (parsed.get("security") or "none").lower()
+    sni = parsed.get("sni") or host
+
     try:
-        with socket.create_connection((parsed["address"], int(parsed["port"])), timeout=TCP_PRE_TIMEOUT):
+        with socket.create_connection((host, port), timeout=TCP_PRE_TIMEOUT) as raw_sock:
+            if sec == "tls":
+                raw_sock.settimeout(TLS_PRE_TIMEOUT)
+                with TLS_CTX.wrap_socket(raw_sock, server_hostname=sni):
+                    return item, True
             return item, True
     except Exception:
         return item, False
@@ -171,7 +215,6 @@ def build_xray_config(p, socks_port):
         "security": sec,
     }
 
-    # Транспорт
     if net == "ws":
         ws_settings = {"path": p.get("path") or "/"}
         host = p.get("host_header") or p.get("sni")
@@ -192,7 +235,6 @@ def build_xray_config(p, socks_port):
             http_settings["host"] = [host]
         stream["httpSettings"] = http_settings
 
-    # Безопасность
     if sec == "tls":
         tls_settings = {
             "serverName": sni,
@@ -215,13 +257,11 @@ def build_xray_config(p, socks_port):
             reality_settings["spiderX"] = p["spx"]
         stream["realitySettings"] = reality_settings
 
-    # Пользователь
     user = {
         "id": p["id"],
         "encryption": "none",
     }
 
-    # flow (xtls-rprx-vision) поддерживается ядром только для TCP + TLS/Reality
     raw_flow = (p.get("flow") or "").strip()
     if raw_flow and net == "tcp" and sec in ("tls", "reality"):
         user["flow"] = raw_flow
@@ -276,7 +316,7 @@ def check_config(parsed):
                 "--socks5-hostname", f"127.0.0.1:{socks_port}",
                 TEST_URL,
             ],
-            capture_output=True, text=True, timeout=CURL_TIMEOUT + 2,
+            capture_output=True, text=True, timeout=CURL_TIMEOUT + 1.5,
         )
         return result.stdout.strip() in ("204", "200")
     except Exception:
@@ -301,103 +341,127 @@ def check_config(parsed):
 
 # ---------- 4. Основной сценарий ----------
 
-def main():
-    if not os.path.exists(SOURCES_FILE):
-        print(f"Файл {SOURCES_FILE} не найден!", flush=True)
-        return
+def load_sources(filepath):
+    trusted_urls = []
+    check_urls = []
+    with open(filepath, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("!"):
+                url = line[1:].strip()
+                if url:
+                    trusted_urls.append(url)
+            else:
+                check_urls.append(line)
+    return trusted_urls, check_urls
 
-    with open(SOURCES_FILE, "r", encoding="utf-8") as f:
-        urls = [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
-    print(f"Параллельная загрузка {len(urls)} источников...", flush=True)
-    all_lines = []
-    errors = 0
-
+def fetch_batch(urls, schemes, label):
+    if not urls:
+        return []
+    print(f"[{label}] Загрузка {len(urls)} источников...", flush=True)
+    collected = []
     with ThreadPoolExecutor(max_workers=10) as fetcher:
         futures = {fetcher.submit(fetch_source, u): u for u in urls}
         for future in as_completed(futures):
             u = futures[future]
             try:
                 text = future.result()
-                lines = extract_configs(text)
-                all_lines.extend(lines)
+                lines = extract_configs(text, schemes=schemes)
+                collected.extend(lines)
                 print(f"OK  ({len(lines):6d}) {u}", flush=True)
             except Exception as e:
-                errors += 1
                 print(f"ERR           {u} -> {e}", flush=True)
+    return collected
 
-    # Умная дедупликация: учитывает UUID, хост, порт, протокол безопасности и SNI,
-    # чтобы не заменять рабочие варианты под белые списки нерабочими дубликатами.
+
+def main():
+    if not os.path.exists(SOURCES_FILE):
+        print(f"Файл {SOURCES_FILE} не найден!", flush=True)
+        return
+
+    trusted_urls, check_urls = load_sources(SOURCES_FILE)
     seen = set()
+
+    # --- Контур 1: Доверенные источники (без проверки Xray) ---
+    trusted_raw = fetch_batch(trusted_urls, SUPPORTED_SCHEMES, "TRUSTED")
+    trusted_lines = []
+    for line in trusted_raw:
+        if line.startswith("vless://"):
+            parsed = parse_vless(line)
+            if not parsed:
+                continue
+        key = make_dedup_key(line)
+        if key not in seen:
+            seen.add(key)
+            trusted_lines.append(line)
+
+    print("----", flush=True)
+    print(f"Доверенных строк собрано: {len(trusted_raw)} | Уникальных включено напрямую: {len(trusted_lines)}", flush=True)
+    print("----", flush=True)
+
+    # --- Контур 2: Проверяемые источники (TCP/TLS + Xray) ---
+    check_raw = fetch_batch(check_urls, ("vless://",), "CHECKED")
     candidates = []
-    for line in all_lines:
+    for line in check_raw:
         parsed = parse_vless(line)
         if not parsed:
             continue
-        key = (
-            parsed["id"],
-            parsed["address"].lower(),
-            parsed["port"],
-            parsed["security"].lower(),
-            parsed["sni"].lower(),
-        )
+        key = make_dedup_key(line)
         if key not in seen:
             seen.add(key)
             candidates.append((line, parsed))
 
     print("----", flush=True)
-    print(f"Собрано сырых VLESS строк: {len(all_lines)}", flush=True)
-    print(f"Уникальных кандидатов: {len(candidates)}", flush=True)
+    print(f"Проверяемых VLESS строк: {len(check_raw)} | Уникальных кандидатов на тест: {len(candidates)}", flush=True)
 
-    if not candidates:
-        print("Подходящих VLESS серверов не найдено.", flush=True)
-        return
+    working_checked_lines = []
+    if candidates:
+        print(f"Этап 1: Быстрый TCP + TLS Handshake pre-check ({len(candidates)} хостов)...", flush=True)
+        live_candidates = []
+        pre_checked = 0
+        with ThreadPoolExecutor(max_workers=PRE_FILTER_CONCURRENCY) as pre_exec:
+            futures = [pre_exec.submit(fast_socket_and_tls_check, c) for c in candidates]
+            for f in as_completed(futures):
+                item, is_alive = f.result()
+                pre_checked += 1
+                if is_alive:
+                    live_candidates.append(item)
+                if pre_checked % 1000 == 0 or pre_checked == len(candidates):
+                    print(f"  Pre-check: {pre_checked}/{len(candidates)} | Прошло дальше: {len(live_candidates)}", flush=True)
 
-    # Этап 1: Быстрый TCP pre-check
-    print(f"Этап 1: TCP pre-check ({len(candidates)} хостов)...", flush=True)
-    live_candidates = []
-    tcp_checked = 0
-    with ThreadPoolExecutor(max_workers=PRE_FILTER_CONCURRENCY) as pre_exec:
-        futures = [pre_exec.submit(fast_tcp_check, c) for c in candidates]
-        for f in as_completed(futures):
-            item, is_alive = f.result()
-            tcp_checked += 1
-            if is_alive:
-                live_candidates.append(item)
-            if tcp_checked % 1000 == 0 or tcp_checked == len(candidates):
-                print(f"  TCP чек: {tcp_checked}/{len(candidates)} | Доступно по порту: {len(live_candidates)}", flush=True)
+        print(f"Живых хостов для Xray: {len(live_candidates)} из {len(candidates)}", flush=True)
 
-    print(f"Живых хостов для Xray: {len(live_candidates)} из {len(candidates)}", flush=True)
+        print(f"Этап 2: Проверка через Xray (таймаут {CURL_TIMEOUT}с, потоков {CHECK_CONCURRENCY})...", flush=True)
+        xray_checked = 0
+        with ThreadPoolExecutor(max_workers=CHECK_CONCURRENCY) as executor:
+            future_map = {executor.submit(check_config, parsed): line for line, parsed in live_candidates}
+            for future in as_completed(future_map):
+                line = future_map[future]
+                xray_checked += 1
+                try:
+                    if future.result():
+                        working_checked_lines.append(line)
+                except Exception:
+                    pass
+                if xray_checked % 50 == 0 or xray_checked == len(live_candidates):
+                    print(f"  Xray чек: {xray_checked}/{len(live_candidates)} | Рабочих: {len(working_checked_lines)}", flush=True)
 
-    # Этап 2: Проверка через Xray
-    print(f"Этап 2: Проверка через Xray (цель: generate_204, параллельность {CHECK_CONCURRENCY})...", flush=True)
-    working_lines = []
-    xray_checked = 0
-    with ThreadPoolExecutor(max_workers=CHECK_CONCURRENCY) as executor:
-        future_map = {executor.submit(check_config, parsed): line for line, parsed in live_candidates}
-        for future in as_completed(future_map):
-            line = future_map[future]
-            xray_checked += 1
-            try:
-                if future.result():
-                    working_lines.append(line)
-            except Exception:
-                pass
-            if xray_checked % 50 == 0 or xray_checked == len(live_candidates):
-                print(f"  Xray чек: {xray_checked}/{len(live_candidates)} | Рабочих: {len(working_lines)}", flush=True)
-
-    # Запись результатов в файлы
-    final_lines = working_lines[:MAX_LINES]
+    # --- Объединение результатов (доверенные идут первыми) ---
+    final_lines = (trusted_lines + working_checked_lines)[:MAX_LINES]
     os.makedirs(OUT_DIR, exist_ok=True)
 
     with open(PLAIN_OUT, "w", encoding="utf-8") as f:
         f.write("\n".join(final_lines))
 
-    b64 = base64.b64encode("\n".join(final_lines).encode("utf-8")).decode("ascii")
+    b64 = base64.b64encode("\r\n".join(final_lines).encode("utf-8")).decode("ascii")
     with open(BASE64_OUT, "w", encoding="utf-8") as f:
         f.write(b64)
 
-    print(f"Готово! В подписку v2rayNG записано серверов: {len(final_lines)}", flush=True)
+    print("----", flush=True)
+    print(f"Готово! В подписку v2rayNG записано серверов: {len(final_lines)} (доверенных: {len(trusted_lines)}, проверенных: {len(working_checked_lines)})", flush=True)
 
 
 if __name__ == "__main__":
