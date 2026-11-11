@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+import ipaddress
 import json
 import os
 import socket
@@ -23,10 +24,9 @@ CHECK_CONCURRENCY = int(os.environ.get("CHECK_CONCURRENCY", "40"))
 PRE_FILTER_CONCURRENCY = 200
 TCP_PRE_TIMEOUT = 1.2
 
-# Сервис проверки взят напрямую из v2rayNG
+# Эталонная проверка доступности в v2rayNG
 TEST_URL = "https://www.gstatic.com/generate_204"
 CURL_TIMEOUT = 4
-XRAY_STARTUP_WAIT = 0.35
 
 
 # ---------- 1. Сбор и парсинг источников ----------
@@ -72,9 +72,20 @@ def extract_configs(raw_text):
     return scan_lines(decoded)
 
 
+def is_safe_address(host):
+    """Отсекает серые, локальные и мусорные IP-адреса."""
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_link_local:
+            return False
+    except ValueError:
+        pass
+    return True
+
+
 def parse_vless(line):
     """
-    Разбирает любые VLESS-конфигурации (TLS, Reality, WS, gRPC, direct).
+    Разбирает VLESS URI с аккуратным извлечением всех query-параметров.
     """
     try:
         body = line[len("vless://"):].split("#", 1)[0]
@@ -83,6 +94,9 @@ def parse_vless(line):
         host = parsed.hostname
         port = parsed.port
         if not uuid or not host or not port:
+            return None
+
+        if not is_safe_address(host):
             return None
 
         qs = urllib.parse.parse_qs(parsed.query)
@@ -121,6 +135,21 @@ def get_free_port():
         return s.getsockname()[1]
 
 
+def wait_for_port(port, timeout=1.5):
+    """
+    Ожидает поднятия локального SOCKS-порта ядром Xray.
+    Устраняет проблему с запаздыванием запуска процессов под нагрузкой.
+    """
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                return True
+        except Exception:
+            time.sleep(0.04)
+    return False
+
+
 def fast_tcp_check(item):
     _, parsed = item
     try:
@@ -133,52 +162,77 @@ def fast_tcp_check(item):
 # ---------- 3. Тест через Xray ----------
 
 def build_xray_config(p, socks_port):
+    net = (p.get("network") or "tcp").lower()
+    sec = (p.get("security") or "none").lower()
+    sni = p.get("sni") or p.get("address")
+
     stream = {
-        "network": p["network"] or "tcp",
-        "security": p["security"] or "none",
+        "network": net,
+        "security": sec,
     }
 
-    if p["network"] == "ws":
-        stream["wsSettings"] = {
-            "path": p.get("path") or "/",
-            "headers": {"Host": p.get("host_header") or p.get("sni") or p["address"]},
-        }
-    elif p["network"] == "grpc":
-        stream["grpcSettings"] = {"serviceName": p.get("service_name") or ""}
-    elif p["network"] in ("h2", "http"):
-        stream["httpSettings"] = {
-            "path": p.get("path") or "/",
-            "host": [p.get("host_header") or p.get("sni") or p["address"]],
-        }
+    # Транспорт
+    if net == "ws":
+        ws_settings = {"path": p.get("path") or "/"}
+        host = p.get("host_header") or p.get("sni")
+        if host:
+            ws_settings["headers"] = {"Host": host}
+        stream["wsSettings"] = ws_settings
 
-    if p["security"] == "tls":
-        tls = {
-            "serverName": p.get("sni") or p["address"],
+    elif net == "grpc":
+        grpc_settings = {"multiMode": False}
+        if p.get("service_name"):
+            grpc_settings["serviceName"] = p["service_name"]
+        stream["grpcSettings"] = grpc_settings
+
+    elif net in ("h2", "http"):
+        http_settings = {"path": p.get("path") or "/"}
+        host = p.get("host_header") or p.get("sni")
+        if host:
+            http_settings["host"] = [host]
+        stream["httpSettings"] = http_settings
+
+    # Безопасность
+    if sec == "tls":
+        tls_settings = {
+            "serverName": sni,
             "allowInsecure": True,
             "fingerprint": p.get("fp") or "chrome",
         }
         if p.get("alpn"):
-            tls["alpn"] = p["alpn"].split(",")
-        stream["tlsSettings"] = tls
-    elif p["security"] == "reality":
-        stream["realitySettings"] = {
-            "serverName": p.get("sni") or p["address"],
+            tls_settings["alpn"] = [a.strip() for a in p["alpn"].split(",") if a.strip()]
+        stream["tlsSettings"] = tls_settings
+
+    elif sec == "reality":
+        reality_settings = {
+            "serverName": sni,
             "fingerprint": p.get("fp") or "chrome",
             "publicKey": p.get("pbk") or "",
-            "shortId": p.get("sid") or "",
-            "spiderX": p.get("spx") or "",
         }
+        # Передаем sid и spx только если они не пустые
+        if p.get("sid"):
+            reality_settings["shortId"] = p["sid"]
+        if p.get("spx"):
+            reality_settings["spiderX"] = p["spx"]
+        stream["realitySettings"] = reality_settings
 
-    user = {"id": p["id"], "encryption": "none"}
-    if p.get("flow"):
-        user["flow"] = p["flow"]
+    # Пользователь
+    user = {
+        "id": p["id"],
+        "encryption": "none",
+    }
+
+    # flow (xtls-rprx-vision) поддерживается ядром только для TCP + TLS/Reality
+    raw_flow = (p.get("flow") or "").strip()
+    if raw_flow and net == "tcp" and sec in ("tls", "reality"):
+        user["flow"] = raw_flow
 
     outbound = {
         "protocol": "vless",
         "settings": {
             "vnext": [{
                 "address": p["address"],
-                "port": p["port"],
+                "port": int(p["port"]),
                 "users": [user]
             }]
         },
@@ -212,7 +266,10 @@ def check_config(parsed):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        time.sleep(XRAY_STARTUP_WAIT)
+
+        # Дожидаемся реального открытия локального сокета
+        if not wait_for_port(socks_port, timeout=1.5):
+            return False
 
         result = subprocess.run(
             [
@@ -244,7 +301,7 @@ def check_config(parsed):
                 pass
 
 
-# ---------- Основной рабочий цикл ----------
+# ---------- 4. Основной сценарий ----------
 
 def main():
     if not os.path.exists(SOURCES_FILE):
@@ -271,7 +328,7 @@ def main():
                 errors += 1
                 print(f"ERR           {u} -> {e}", flush=True)
 
-    # Дедупликация (все VLESS конфигурации)
+    # Дедупликация (все валидные VLESS-конфигурации)
     seen = set()
     candidates = []
     for line in all_lines:
@@ -291,7 +348,7 @@ def main():
         print("Подходящих VLESS серверов не найдено.", flush=True)
         return
 
-    # 1. Быстрый сокет-фильтр
+    # Этап 1: Быстрый TCP pre-check
     print(f"Этап 1: TCP pre-check ({len(candidates)} хостов)...", flush=True)
     live_candidates = []
     tcp_checked = 0
@@ -307,7 +364,7 @@ def main():
 
     print(f"Живых хостов для Xray: {len(live_candidates)} из {len(candidates)}", flush=True)
 
-    # 2. Xray чек через generate_204
+    # Этап 2: Полная проверка через Xray
     print(f"Этап 2: Проверка через Xray (цель: generate_204, параллельность {CHECK_CONCURRENCY})...", flush=True)
     working_lines = []
     xray_checked = 0
@@ -324,7 +381,7 @@ def main():
             if xray_checked % 50 == 0 or xray_checked == len(live_candidates):
                 print(f"  Xray чек: {xray_checked}/{len(live_candidates)} | Рабочих: {len(working_lines)}", flush=True)
 
-    # Сохранение результатов
+    # Запись результатов в файлы
     final_lines = working_lines[:MAX_LINES]
     os.makedirs(OUT_DIR, exist_ok=True)
 
