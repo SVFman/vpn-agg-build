@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import base64
+import json
 import os
+import urllib.parse
 import urllib.request
 
 SOURCES_FILE = "subscription-sources.txt"
@@ -9,9 +11,6 @@ PLAIN_OUT = f"{OUT_DIR}/aggregated.txt"
 BASE64_OUT = f"{OUT_DIR}/aggregated_base64.txt"
 TIMEOUT = 15
 
-# Жёсткий потолок на итоговое число строк: GitHub не принимает файлы
-# больше 100 МБ, а список на сотни тысяч серверов всё равно бесполезен
-# на практике (v2rayNG не тестирует их осмысленно, большинство нерабочие).
 MAX_LINES = 20000
 
 
@@ -67,6 +66,41 @@ def extract_configs(raw_text):
     return scan_lines(decoded)
 
 
+def connection_key(line):
+    """
+    Возвращает "суть" сервера (хост+порт+id), игнорируя имя/remark,
+    чтобы ловить дубликаты так же, как это делает v2rayNG — а не только
+    строки, совпадающие посимвольно целиком.
+    Если распарсить не получилось — используем строку как есть
+    (не ломает дедупликацию, просто не улучшает её для этой строки).
+    """
+    try:
+        if line.startswith("vless://"):
+            body = line[len("vless://"):]
+            # отрезаем remark (#...) перед парсингом
+            body = body.split("#", 1)[0]
+            parsed = urllib.parse.urlparse("vless://" + body)
+            uuid = parsed.username or ""
+            host = (parsed.hostname or "").lower()
+            port = parsed.port or 0
+            return ("vless", uuid, host, port)
+
+        if line.startswith("vmess://"):
+            payload = line[len("vmess://"):].split("#", 1)[0]
+            padding = len(payload) % 4
+            if padding:
+                payload += "=" * (4 - padding)
+            decoded = base64.b64decode(payload).decode("utf-8", errors="ignore")
+            data = json.loads(decoded)
+            vid = str(data.get("id", ""))
+            host = str(data.get("add", "")).lower()
+            port = str(data.get("port", ""))
+            return ("vmess", vid, host, port)
+    except Exception:
+        pass
+    return ("raw", line)
+
+
 def main():
     urls = read_sources(SOURCES_FILE)
     all_lines = []
@@ -83,7 +117,15 @@ def main():
             print(f"ERR           {url} -> {e}")
 
     total_collected = len(all_lines)
-    deduped = list(dict.fromkeys(all_lines))
+
+    seen = set()
+    deduped = []
+    for line in all_lines:
+        key = connection_key(line)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(line)
 
     truncated = len(deduped) > MAX_LINES
     final_lines = deduped[:MAX_LINES] if truncated else deduped
@@ -100,7 +142,8 @@ def main():
 
     print("----")
     print(f"Источников: {len(urls)}, ошибок: {len(errors)}")
-    print(f"Собрано всего: {total_collected}, после дедупа: {len(deduped)}")
+    print(f"Собрано всего: {total_collected}")
+    print(f"После дедупа по host+port+id (игнорируя имя): {len(deduped)}")
     if truncated:
         print(f"Обрезано до лимита: {MAX_LINES}")
 
