@@ -3,6 +3,7 @@ import base64
 import ipaddress
 import json
 import os
+import queue
 import socket
 import ssl
 import subprocess
@@ -21,17 +22,16 @@ FETCH_TIMEOUT = 12
 MAX_LINES = 20000
 
 XRAY_BIN = os.environ.get("XRAY_BIN", "./xray")
-# Пункт 2: Увеличенная параллельность для спящих сетевых процессов
 CHECK_CONCURRENCY = int(os.environ.get("CHECK_CONCURRENCY", "70"))
 PRE_FILTER_CONCURRENCY = 250
 TCP_PRE_TIMEOUT = 1.0
 TLS_PRE_TIMEOUT = 1.2
 
-# Пункт 1: Агрессивный таймаут для отсечения тормозящих прокси
 TEST_URL = "https://www.gstatic.com/generate_204"
 CURL_TIMEOUT = 2.5
 
-SUPPORTED_SCHEMES = (
+# Протоколы для доверенного контура (!)
+TRUSTED_SCHEMES = (
     "vless://",
     "vmess://",
     "trojan://",
@@ -42,8 +42,16 @@ SUPPORTED_SCHEMES = (
     "wireguard://",
 )
 
+# Протоколы для активной проверки через Xray
+CHECKED_SCHEMES = ("vless://", "vmess://")
 
-# ---------- 1. Сбор и парсинг источников ----------
+# Потокобезопасный пул портов для исключения гонки между 70 потоками
+PORT_POOL = queue.Queue()
+for _p in range(30000, 45000):
+    PORT_POOL.put(_p)
+
+
+# ---------- 1. Сбор и декодирование источников ----------
 
 def fetch_source(url):
     req = urllib.request.Request(
@@ -76,7 +84,7 @@ def scan_lines(text, schemes):
     return found
 
 
-def extract_configs(raw_text, schemes=SUPPORTED_SCHEMES):
+def extract_configs(raw_text, schemes):
     direct = scan_lines(raw_text, schemes)
     if direct:
         return direct
@@ -96,6 +104,8 @@ def is_safe_address(host):
         pass
     return True
 
+
+# ---------- 2. Парсеры VLESS и VMess ----------
 
 def parse_vless(line):
     try:
@@ -138,28 +148,86 @@ def parse_vless(line):
         return None
 
 
-def make_dedup_key(line):
+def parse_vmess(line):
+    """Разбирает стандартный vmess:// (Base64 JSON)."""
+    try:
+        raw_b64 = line[len("vmess://"):].split("#", 1)[0].strip()
+        decoded = try_base64_decode(raw_b64)
+        if not decoded:
+            return None
+        data = json.loads(decoded)
+        if not isinstance(data, dict):
+            return None
+
+        host = str(data.get("add") or "").strip()
+        port = int(data.get("port") or 0)
+        uuid = str(data.get("id") or "").strip()
+        if not host or not port or not uuid:
+            return None
+
+        if not is_safe_address(host):
+            return None
+
+        net = str(data.get("net") or "tcp").lower()
+        tls_raw = str(data.get("tls") or "").lower()
+        sec = "tls" if tls_raw in ("tls", "1", "true") else "none"
+        sni = str(data.get("sni") or data.get("host") or host).strip()
+        host_header = str(data.get("host") or "").strip()
+        path = str(data.get("path") or "/").strip() or "/"
+        aid = int(data.get("aid") or 0)
+        scy = str(data.get("scy") or "auto").strip() or "auto"
+
+        return {
+            "protocol": "vmess",
+            "address": host,
+            "port": port,
+            "id": uuid,
+            "alterId": aid,
+            "security_vmess": scy,
+            "network": net,
+            "security": sec,
+            "sni": sni,
+            "fp": str(data.get("fp") or "chrome"),
+            "path": path,
+            "host_header": host_header,
+            "service_name": path if net == "grpc" else "",
+            "alpn": str(data.get("alpn") or ""),
+        }
+    except Exception:
+        return None
+
+
+def parse_config_line(line):
     if line.startswith("vless://"):
-        parsed = parse_vless(line)
-        if parsed:
-            return (
-                "vless",
-                parsed["id"],
-                parsed["address"].lower(),
-                parsed["port"],
-                parsed["security"].lower(),
-                parsed["sni"].lower(),
-            )
+        return parse_vless(line)
+    if line.startswith("vmess://"):
+        return parse_vmess(line)
+    return None
+
+
+def make_dedup_key(line, parsed=None):
+    """
+    Умная дедупликация:
+    - для VLESS и VMess формирует структурный ключ по параметрам узла;
+    - для остальных протоколов из доверенного списка сравнивает URI без #remark.
+    """
+    if parsed is None:
+        parsed = parse_config_line(line)
+
+    if parsed:
+        return (
+            parsed["protocol"],
+            parsed["id"],
+            parsed["address"].lower(),
+            parsed["port"],
+            parsed["security"].lower(),
+            parsed["sni"].lower(),
+            parsed.get("path", "/"),
+        )
     return ("raw", line.split("#", 1)[0].strip())
 
 
-# ---------- 2. Быстрые сетевые фильтры (TCP + TLS Pre-check) ----------
-
-def get_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
+# ---------- 3. Быстрые сетевые фильтры (TCP + TLS Pre-check) ----------
 
 def wait_for_port(port, timeout=1.5):
     start_time = time.time()
@@ -172,20 +240,12 @@ def wait_for_port(port, timeout=1.5):
     return False
 
 
-# Контекст для быстрого TLS handshake без проверки валидности сертификата
 TLS_CTX = ssl.create_default_context()
 TLS_CTX.check_hostname = False
 TLS_CTX.verify_mode = ssl.CERT_NONE
 
 
 def fast_socket_and_tls_check(item):
-    """
-    Пункт 3: Объединённый быстрый тест.
-    1. Проверяет доступность TCP-порта.
-    2. Если security == 'tls', сразу делает лёгкий TLS Handshake на сокетах Python,
-       отсеивая неработающие TLS-узлы без запуска бинарника Xray.
-       Reality и none пропускаются дальше напрямую в Xray.
-    """
     _, parsed = item
     host = parsed["address"]
     port = int(parsed["port"])
@@ -203,9 +263,10 @@ def fast_socket_and_tls_check(item):
         return item, False
 
 
-# ---------- 3. Тест через Xray ----------
+# ---------- 4. Сборка JSON и проверка через Xray ----------
 
 def build_xray_config(p, socks_port):
+    proto = p["protocol"]
     net = (p.get("network") or "tcp").lower()
     sec = (p.get("security") or "none").lower()
     sni = p.get("sni") or p.get("address")
@@ -257,26 +318,42 @@ def build_xray_config(p, socks_port):
             reality_settings["spiderX"] = p["spx"]
         stream["realitySettings"] = reality_settings
 
-    user = {
-        "id": p["id"],
-        "encryption": "none",
-    }
+    if proto == "vless":
+        user = {
+            "id": p["id"],
+            "encryption": "none",
+        }
+        raw_flow = (p.get("flow") or "").strip()
+        if raw_flow and net == "tcp" and sec in ("tls", "reality"):
+            user["flow"] = raw_flow
 
-    raw_flow = (p.get("flow") or "").strip()
-    if raw_flow and net == "tcp" and sec in ("tls", "reality"):
-        user["flow"] = raw_flow
-
-    outbound = {
-        "protocol": "vless",
-        "settings": {
-            "vnext": [{
-                "address": p["address"],
-                "port": int(p["port"]),
-                "users": [user]
-            }]
-        },
-        "streamSettings": stream,
-    }
+        outbound = {
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": p["address"],
+                    "port": int(p["port"]),
+                    "users": [user]
+                }]
+            },
+            "streamSettings": stream,
+        }
+    else:  # vmess
+        outbound = {
+            "protocol": "vmess",
+            "settings": {
+                "vnext": [{
+                    "address": p["address"],
+                    "port": int(p["port"]),
+                    "users": [{
+                        "id": p["id"],
+                        "alterId": p.get("alterId", 0),
+                        "security": p.get("security_vmess", "auto"),
+                    }]
+                }]
+            },
+            "streamSettings": stream,
+        }
 
     return {
         "log": {"loglevel": "none"},
@@ -291,7 +368,7 @@ def build_xray_config(p, socks_port):
 
 
 def check_config(parsed):
-    socks_port = get_free_port()
+    socks_port = PORT_POOL.get()
     config = build_xray_config(parsed, socks_port)
     config_path = None
     proc = None
@@ -337,9 +414,11 @@ def check_config(parsed):
                 os.remove(config_path)
             except Exception:
                 pass
+        # Возвращаем порт в пул только после гарантированного завершения процесса Xray
+        PORT_POOL.put(socks_port)
 
 
-# ---------- 4. Основной сценарий ----------
+# ---------- 5. Основной сценарий ----------
 
 def load_sources(filepath):
     trusted_urls = []
@@ -386,14 +465,13 @@ def main():
     seen = set()
 
     # --- Контур 1: Доверенные источники (без проверки Xray) ---
-    trusted_raw = fetch_batch(trusted_urls, SUPPORTED_SCHEMES, "TRUSTED")
+    trusted_raw = fetch_batch(trusted_urls, TRUSTED_SCHEMES, "TRUSTED")
     trusted_lines = []
     for line in trusted_raw:
-        if line.startswith("vless://"):
-            parsed = parse_vless(line)
-            if not parsed:
-                continue
-        key = make_dedup_key(line)
+        parsed = parse_config_line(line)
+        if line.startswith(CHECKED_SCHEMES) and not parsed:
+            continue
+        key = make_dedup_key(line, parsed)
         if key not in seen:
             seen.add(key)
             trusted_lines.append(line)
@@ -402,20 +480,20 @@ def main():
     print(f"Доверенных строк собрано: {len(trusted_raw)} | Уникальных включено напрямую: {len(trusted_lines)}", flush=True)
     print("----", flush=True)
 
-    # --- Контур 2: Проверяемые источники (TCP/TLS + Xray) ---
-    check_raw = fetch_batch(check_urls, ("vless://",), "CHECKED")
+    # --- Контур 2: Проверяемые источники (VLESS + VMess -> TCP/TLS -> Xray) ---
+    check_raw = fetch_batch(check_urls, CHECKED_SCHEMES, "CHECKED")
     candidates = []
     for line in check_raw:
-        parsed = parse_vless(line)
+        parsed = parse_config_line(line)
         if not parsed:
             continue
-        key = make_dedup_key(line)
+        key = make_dedup_key(line, parsed)
         if key not in seen:
             seen.add(key)
             candidates.append((line, parsed))
 
     print("----", flush=True)
-    print(f"Проверяемых VLESS строк: {len(check_raw)} | Уникальных кандидатов на тест: {len(candidates)}", flush=True)
+    print(f"Проверяемых строк (VLESS/VMess): {len(check_raw)} | Уникальных кандидатов на тест: {len(candidates)}", flush=True)
 
     working_checked_lines = []
     if candidates:
@@ -449,7 +527,7 @@ def main():
                 if xray_checked % 50 == 0 or xray_checked == len(live_candidates):
                     print(f"  Xray чек: {xray_checked}/{len(live_candidates)} | Рабочих: {len(working_checked_lines)}", flush=True)
 
-    # --- Объединение результатов (доверенные идут первыми) ---
+    # --- Объединение результатов ---
     final_lines = (trusted_lines + working_checked_lines)[:MAX_LINES]
     os.makedirs(OUT_DIR, exist_ok=True)
 
