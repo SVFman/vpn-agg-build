@@ -1,32 +1,35 @@
-https://github.com/AvenCores/goida-vpn-configs/raw/refs/heads/main/githubmirror/26.txt
-https://github.com/Epodonios/v2ray-configs/raw/main/All_Configs_base64_Sub.txt
-https://raw.githubusercontent.com/NiREvil/vless/main/sub.txt
-https://raw.githubusercontent.com/sevcator/5ubscrpt10n/main/protocols/vl.txt
-https://raw.githubusercontent.com/zieng2/wl/main/vless_lite.txt
-https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt
-https://raw.githubusercontent.com/dequar/deqwl/main/vless_checked.txt
+# =====================================================================
+# Репозиторий igareck/vpn-configs-for-russia (уникальные оригиналы)
+# =====================================================================
+# Reality и обход белых списков (наивысший приоритет под ТСПУ)
+https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
+https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-SNI-RU-all.txt
+https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-checked.txt
+https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-all.txt
+
+# Черные списки (общий пул VLESS)
+https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt
+https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt
+
+# =====================================================================
+# Сторонние проверенные источники (GitHub)
+# =====================================================================
 https://raw.githubusercontent.com/vsevjik/OBWLautoupd/refs/heads/main/ru_vless_reality.txt
 https://raw.githubusercontent.com/tankist939-afk/Obhod-WL/refs/heads/main/Obhod%20WL
+https://raw.githubusercontent.com/dequar/deqwl/main/vless_checked.txt
+https://raw.githubusercontent.com/zieng2/wl/main/vless_lite.txt
+https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt
+https://raw.githubusercontent.com/sevcator/5ubscrpt10n/main/protocols/vl.txt
 https://raw.githubusercontent.com/EtoNeYaProject/etoneyaproject.github.io/refs/heads/main/whitelist
 https://raw.githubusercontent.com/ShadowException/VPN/refs/heads/main/configs/VPN-cat
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_SS+All_RUS.txt
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-all.txt
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-checked.txt
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-SNI-RU-all.txt
-https://gitverse.ru/api/repos/cyberportal/wl/raw/branch/master/README.md
-https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/EtoNeYa/EtoNeYa_wl.txt
+https://github.com/AvenCores/goida-vpn-configs/raw/refs/heads/main/githubmirror/26.txt
+
+# =====================================================================
+# Зеркала и базы на GitVerse (уникальные подборки)
+# =====================================================================
 https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/KvRuVPN/KvRuVPN.txt
-https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/OutlineVPN/OutlineVPN.txt
-https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/RkpVPN/RKP_Check.txt
 https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/RkpVPN/RKP_work.txt
 https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/RosTun/utf-8_gen.txt
 https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/TG-%40WLTGFF/TG-%40WLTGFF.txt
 https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/Zieng2/Zieng2_NowMeow.txt
-https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/Zieng2/Zieng2_vless_lite.txt
-https://gitverse.ru/api/repos/LowiK/LowiKLive/raw/branch/main/WhiteList-Bypass_Ru.txt
 https://rstnnl.gitverse.site/sb/dev.txt
-https://ru-wbl.gitverse.site/wl/RosTun/Base64_wl.txt
