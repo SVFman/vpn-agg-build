@@ -1,19 +1,32 @@
 # =====================================================================
-# Репозиторий igareck/vpn-configs-for-russia (уникальные оригиналы)
+# ДОВЕРЕННЫЕ ИСТОЧНИКИ БЕЗ ПРОВЕРКИ XRAY (префикс !)
+# Скрипт скачивает их, очищает от дублей и сразу добавляет в подписку
 # =====================================================================
-# Reality и обход белых списков (наивысший приоритет под ТСПУ)
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-SNI-RU-all.txt
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-checked.txt
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-all.txt
 
-# Черные списки (общий пул VLESS)
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt
+# --- 1. Белые списки (обход ТСПУ / белых списков операторов РФ) ---
+!https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
+!https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-checked.txt
+!https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-all.txt
+!https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-SNI-RU-all.txt
+
+# --- 2. Черные списки (общий пул зарубежных серверов) ---
+!https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt
+!https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt
+!https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_SS%2BAll_RUS.txt
+!https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_SS_WEAK_DPI_RUS.txt
+
+# --- 3. Мосты Tor (для Tor Browser / Orbot) ---
+!https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/TOR-BRIDGES/TOR_BRIDGES_TOP100.txt
+!https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/TOR-BRIDGES/TOR_BRIDGES_ALL.txt
+!https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/TOR-BRIDGES/TOR_BRIDGES_VANILLA.txt
+!https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/TOR-BRIDGES/TOR_BRIDGES_OBFS4.txt
+!https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/TOR-BRIDGES/TOR_BRIDGES_WEBTUNNEL.txt
 
 # =====================================================================
-# Сторонние проверенные источники (GitHub)
+# ПРОВЕРЯЕМЫЕ ИСТОЧНИКИ (проходят полный цикл: TCP + Xray)
 # =====================================================================
+
+# --- Сторонние проверенные источники (GitHub) ---
 https://raw.githubusercontent.com/vsevjik/OBWLautoupd/refs/heads/main/ru_vless_reality.txt
 https://raw.githubusercontent.com/tankist939-afk/Obhod-WL/refs/heads/main/Obhod%20WL
 https://raw.githubusercontent.com/dequar/deqwl/main/vless_checked.txt
@@ -24,9 +37,7 @@ https://raw.githubusercontent.com/EtoNeYaProject/etoneyaproject.github.io/refs/h
 https://raw.githubusercontent.com/ShadowException/VPN/refs/heads/main/configs/VPN-cat
 https://github.com/AvenCores/goida-vpn-configs/raw/refs/heads/main/githubmirror/26.txt
 
-# =====================================================================
-# Зеркала и базы на GitVerse (уникальные подборки)
-# =====================================================================
+# --- Зеркала и базы на GitVerse (уникальные подборки) ---
 https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/KvRuVPN/KvRuVPN.txt
 https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/RkpVPN/RKP_work.txt
 https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/RosTun/utf-8_gen.txt
