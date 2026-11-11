@@ -85,7 +85,7 @@ def is_safe_address(host):
 
 def parse_vless(line):
     """
-    Разбирает VLESS URI с аккуратным извлечением всех query-параметров.
+    Разбирает VLESS URI с аккуратным извлечением всех параметров.
     """
     try:
         body = line[len("vless://"):].split("#", 1)[0]
@@ -138,7 +138,7 @@ def get_free_port():
 def wait_for_port(port, timeout=1.5):
     """
     Ожидает поднятия локального SOCKS-порта ядром Xray.
-    Устраняет проблему с запаздыванием запуска процессов под нагрузкой.
+    Устраняет race condition при старте процессов.
     """
     start_time = time.time()
     while time.time() - start_time < timeout:
@@ -209,7 +209,6 @@ def build_xray_config(p, socks_port):
             "fingerprint": p.get("fp") or "chrome",
             "publicKey": p.get("pbk") or "",
         }
-        # Передаем sid и spx только если они не пустые
         if p.get("sid"):
             reality_settings["shortId"] = p["sid"]
         if p.get("spx"):
@@ -267,7 +266,6 @@ def check_config(parsed):
             stderr=subprocess.DEVNULL,
         )
 
-        # Дожидаемся реального открытия локального сокета
         if not wait_for_port(socks_port, timeout=1.5):
             return False
 
@@ -328,14 +326,21 @@ def main():
                 errors += 1
                 print(f"ERR           {u} -> {e}", flush=True)
 
-    # Дедупликация (все валидные VLESS-конфигурации)
+    # Умная дедупликация: учитывает UUID, хост, порт, протокол безопасности и SNI,
+    # чтобы не заменять рабочие варианты под белые списки нерабочими дубликатами.
     seen = set()
     candidates = []
     for line in all_lines:
         parsed = parse_vless(line)
         if not parsed:
             continue
-        key = (parsed["id"], parsed["address"].lower(), parsed["port"])
+        key = (
+            parsed["id"],
+            parsed["address"].lower(),
+            parsed["port"],
+            parsed["security"].lower(),
+            parsed["sni"].lower(),
+        )
         if key not in seen:
             seen.add(key)
             candidates.append((line, parsed))
@@ -364,7 +369,7 @@ def main():
 
     print(f"Живых хостов для Xray: {len(live_candidates)} из {len(candidates)}", flush=True)
 
-    # Этап 2: Полная проверка через Xray
+    # Этап 2: Проверка через Xray
     print(f"Этап 2: Проверка через Xray (цель: generate_204, параллельность {CHECK_CONCURRENCY})...", flush=True)
     working_lines = []
     xray_checked = 0
