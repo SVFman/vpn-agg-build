@@ -1,0 +1,33 @@
+name: Update Igareck Subscription
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-igareck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Aggregate Igareck trusted lists
+        run: python scripts/aggregate_subscription.py --mode trusted
+
+      - name: Commit updated Igareck subscription
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Auto-update Igareck subscription"
+          file_pattern: "subscription/igareck*.txt"
+          
