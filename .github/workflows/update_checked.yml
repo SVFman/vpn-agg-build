@@ -1,0 +1,38 @@
+name: Update Checked Subscription (Xray)
+
+on:
+  schedule:
+    - cron: "0 */5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-checked:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download Xray-core
+        run: |
+          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q Xray-linux-64.zip xray
+          chmod +x xray
+
+      - name: Run Xray validation
+        run: python scripts/aggregate_subscription.py --mode checked
+
+      - name: Commit updated Checked subscription
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Auto-update checked subscription (Xray)"
+          file_pattern: "subscription/checked*.txt"
