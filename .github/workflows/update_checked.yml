@@ -1,8 +1,8 @@
-name: Update Checked Subscription (Xray)
+name: Update Checked Subscription (TCP/TLS)
 
 on:
   schedule:
-    - cron: "0 */5 * * *"
+    - cron: "0 */3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   build-checked:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
@@ -26,17 +26,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Download Xray-core
-        run: |
-          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-          unzip -q Xray-linux-64.zip xray
-          chmod +x xray
-
-      - name: Run Xray validation
+      - name: Run TCP/TLS validation
         run: python scripts/aggregate_subscription.py --mode checked
 
       - name: Commit updated Checked subscription
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Auto-update checked subscription (Xray)"
+          commit_message: "Auto-update checked subscription (TCP/TLS)"
           file_pattern: "subscription/checked*.txt"
