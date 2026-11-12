@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import base64
 import ipaddress
 import json
@@ -15,8 +16,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SOURCES_FILE = "subscription-sources.txt"
 OUT_DIR = "subscription"
-PLAIN_OUT = f"{OUT_DIR}/aggregated.txt"
-BASE64_OUT = f"{OUT_DIR}/aggregated_base64.txt"
 FETCH_TIMEOUT = 12
 
 MAX_LINES = 20000
@@ -30,7 +29,6 @@ TLS_PRE_TIMEOUT = 1.2
 TEST_URL = "https://www.gstatic.com/generate_204"
 CURL_TIMEOUT = 2.5
 
-# Протоколы для доверенного контура (!)
 TRUSTED_SCHEMES = (
     "vless://",
     "vmess://",
@@ -42,10 +40,8 @@ TRUSTED_SCHEMES = (
     "wireguard://",
 )
 
-# Протоколы для активной проверки через Xray
 CHECKED_SCHEMES = ("vless://", "vmess://")
 
-# Потокобезопасный пул портов для исключения гонки между 70 потоками
 PORT_POOL = queue.Queue()
 for _p in range(30000, 45000):
     PORT_POOL.put(_p)
@@ -95,7 +91,6 @@ def extract_configs(raw_text, schemes):
 
 
 def is_safe_address(host):
-    """Отсекает серые, локальные и мусорные IP-адреса."""
     try:
         ip = ipaddress.ip_address(host)
         if ip.is_private or ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_link_local:
@@ -116,7 +111,6 @@ def parse_vless(line):
         port = parsed.port
         if not uuid or not host or not port:
             return None
-
         if not is_safe_address(host):
             return None
 
@@ -149,7 +143,6 @@ def parse_vless(line):
 
 
 def parse_vmess(line):
-    """Разбирает стандартный vmess:// (Base64 JSON)."""
     try:
         raw_b64 = line[len("vmess://"):].split("#", 1)[0].strip()
         decoded = try_base64_decode(raw_b64)
@@ -164,7 +157,6 @@ def parse_vmess(line):
         uuid = str(data.get("id") or "").strip()
         if not host or not port or not uuid:
             return None
-
         if not is_safe_address(host):
             return None
 
@@ -206,11 +198,6 @@ def parse_config_line(line):
 
 
 def make_dedup_key(line, parsed=None):
-    """
-    Умная дедупликация:
-    - для VLESS и VMess формирует структурный ключ по параметрам узла;
-    - для остальных протоколов из доверенного списка сравнивает URI без #remark.
-    """
     if parsed is None:
         parsed = parse_config_line(line)
 
@@ -227,7 +214,7 @@ def make_dedup_key(line, parsed=None):
     return ("raw", line.split("#", 1)[0].strip())
 
 
-# ---------- 3. Быстрые сетевые фильтры (TCP + TLS Pre-check) ----------
+# ---------- 3. Быстрые сетевые фильтры ----------
 
 def wait_for_port(port, timeout=1.5):
     start_time = time.time()
@@ -338,7 +325,7 @@ def build_xray_config(p, socks_port):
             },
             "streamSettings": stream,
         }
-    else:  # vmess
+    else:
         outbound = {
             "protocol": "vmess",
             "settings": {
@@ -414,11 +401,10 @@ def check_config(parsed):
                 os.remove(config_path)
             except Exception:
                 pass
-        # Возвращаем порт в пул только после гарантированного завершения процесса Xray
         PORT_POOL.put(socks_port)
 
 
-# ---------- 5. Основной сценарий ----------
+# ---------- 5. Управление источниками и сохранением ----------
 
 def load_sources(filepath):
     trusted_urls = []
@@ -456,16 +442,25 @@ def fetch_batch(urls, schemes, label):
     return collected
 
 
-def main():
-    if not os.path.exists(SOURCES_FILE):
-        print(f"Файл {SOURCES_FILE} не найден!", flush=True)
-        return
+def save_subscription(lines, prefix):
+    final_lines = lines[:MAX_LINES]
+    os.makedirs(OUT_DIR, exist_ok=True)
+    plain_path = f"{OUT_DIR}/{prefix}.txt"
+    b64_path = f"{OUT_DIR}/{prefix}_base64.txt"
 
-    trusted_urls, check_urls = load_sources(SOURCES_FILE)
+    with open(plain_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(final_lines))
+
+    b64 = base64.b64encode("\r\n".join(final_lines).encode("utf-8")).decode("ascii")
+    with open(b64_path, "w", encoding="utf-8") as f:
+        f.write(b64)
+
+    print(f"Сохранено в {plain_path} и {b64_path}: {len(final_lines)} серверов.", flush=True)
+
+
+def run_trusted(trusted_urls):
     seen = set()
-
-    # --- Контур 1: Доверенные источники (без проверки Xray) ---
-    trusted_raw = fetch_batch(trusted_urls, TRUSTED_SCHEMES, "TRUSTED")
+    trusted_raw = fetch_batch(trusted_urls, TRUSTED_SCHEMES, "IGARECK/TRUSTED")
     trusted_lines = []
     for line in trusted_raw:
         parsed = parse_config_line(line)
@@ -477,10 +472,12 @@ def main():
             trusted_lines.append(line)
 
     print("----", flush=True)
-    print(f"Доверенных строк собрано: {len(trusted_raw)} | Уникальных включено напрямую: {len(trusted_lines)}", flush=True)
-    print("----", flush=True)
+    print(f"[IGARECK] Собрано строк: {len(trusted_raw)} | Уникальных: {len(trusted_lines)}", flush=True)
+    save_subscription(trusted_lines, "igareck")
 
-    # --- Контур 2: Проверяемые источники (VLESS + VMess -> TCP/TLS -> Xray) ---
+
+def run_checked(check_urls):
+    seen = set()
     check_raw = fetch_batch(check_urls, CHECKED_SCHEMES, "CHECKED")
     candidates = []
     for line in check_raw:
@@ -493,11 +490,11 @@ def main():
             candidates.append((line, parsed))
 
     print("----", flush=True)
-    print(f"Проверяемых строк (VLESS/VMess): {len(check_raw)} | Уникальных кандидатов на тест: {len(candidates)}", flush=True)
+    print(f"[CHECKED] Собрано строк: {len(check_raw)} | Уникальных кандидатов: {len(candidates)}", flush=True)
 
-    working_checked_lines = []
+    working_lines = []
     if candidates:
-        print(f"Этап 1: Быстрый TCP + TLS Handshake pre-check ({len(candidates)} хостов)...", flush=True)
+        print(f"Этап 1: Быстрый TCP + TLS pre-check ({len(candidates)} хостов)...", flush=True)
         live_candidates = []
         pre_checked = 0
         with ThreadPoolExecutor(max_workers=PRE_FILTER_CONCURRENCY) as pre_exec:
@@ -521,25 +518,37 @@ def main():
                 xray_checked += 1
                 try:
                     if future.result():
-                        working_checked_lines.append(line)
+                        working_lines.append(line)
                 except Exception:
                     pass
                 if xray_checked % 50 == 0 or xray_checked == len(live_candidates):
-                    print(f"  Xray чек: {xray_checked}/{len(live_candidates)} | Рабочих: {len(working_checked_lines)}", flush=True)
-
-    # --- Объединение результатов ---
-    final_lines = (trusted_lines + working_checked_lines)[:MAX_LINES]
-    os.makedirs(OUT_DIR, exist_ok=True)
-
-    with open(PLAIN_OUT, "w", encoding="utf-8") as f:
-        f.write("\n".join(final_lines))
-
-    b64 = base64.b64encode("\r\n".join(final_lines).encode("utf-8")).decode("ascii")
-    with open(BASE64_OUT, "w", encoding="utf-8") as f:
-        f.write(b64)
+                    print(f"  Xray чек: {xray_checked}/{len(live_candidates)} | Рабочих: {len(working_lines)}", flush=True)
 
     print("----", flush=True)
-    print(f"Готово! В подписку v2rayNG записано серверов: {len(final_lines)} (доверенных: {len(trusted_lines)}, проверенных: {len(working_checked_lines)})", flush=True)
+    save_subscription(working_lines, "checked")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="VPN Subscription Aggregator")
+    parser.add_argument(
+        "--mode",
+        choices=["trusted", "checked", "all"],
+        default="all",
+        help="Режим сборки: trusted (только Igareck), checked (проверка Xray), all (оба)",
+    )
+    args = parser.parse_args()
+
+    if not os.path.exists(SOURCES_FILE):
+        print(f"Файл {SOURCES_FILE} не найден!", flush=True)
+        return
+
+    trusted_urls, check_urls = load_sources(SOURCES_FILE)
+
+    if args.mode in ("trusted", "all"):
+        run_trusted(trusted_urls)
+
+    if args.mode in ("checked", "all"):
+        run_checked(check_urls)
 
 
 if __name__ == "__main__":
