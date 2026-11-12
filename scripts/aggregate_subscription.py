@@ -4,8 +4,6 @@ import base64
 import ipaddress
 import json
 import os
-import socket
-import ssl
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,11 +12,6 @@ SOURCES_FILE = "subscription-sources.txt"
 OUT_DIR = "subscription"
 FETCH_TIMEOUT = 12
 MAX_LINES = 20000
-
-# Параметры быстрой проверки доступности узла (TCP + TLS)
-CHECK_CONCURRENCY = 250
-TCP_TIMEOUT = 2.0
-TLS_TIMEOUT = 2.2
 
 TRUSTED_SCHEMES = (
     "vless://",
@@ -31,7 +24,16 @@ TRUSTED_SCHEMES = (
     "wireguard://",
 )
 
-CHECKED_SCHEMES = ("vless://", "vmess://")
+CHECKED_SCHEMES = (
+    "vless://",
+    "vmess://",
+    "trojan://",
+    "ss://",
+    "hy2://",
+    "hysteria2://",
+    "tuic://",
+    "wireguard://",
+)
 
 
 # ---------- 1. Сбор и декодирование источников ----------
@@ -87,7 +89,7 @@ def is_safe_address(host):
     return True
 
 
-# ---------- 2. Парсеры VLESS и VMess ----------
+# ---------- 2. Парсеры для фильтрации небезопасных IP и дедупликации Igareck ----------
 
 def parse_vless(line):
     try:
@@ -181,38 +183,7 @@ def make_dedup_key(line, parsed=None):
     return ("raw", line.split("#", 1)[0].strip())
 
 
-# ---------- 3. Облегчённая проверка доступности (TCP + TLS Handshake) ----------
-
-TLS_CTX = ssl.create_default_context()
-TLS_CTX.check_hostname = False
-TLS_CTX.verify_mode = ssl.CERT_NONE
-
-
-def check_socket_and_tls(item):
-    """
-    Проверяет:
-    1. Открыт ли TCP-порт на сервере.
-    2. Если security == 'tls', проходит ли TLS Handshake с указанным SNI.
-    Reality и none засчитываются сразу после успешного TCP-соединения.
-    """
-    line, parsed = item
-    host = parsed["address"]
-    port = int(parsed["port"])
-    sec = (parsed.get("security") or "none").lower()
-    sni = parsed.get("sni") or host
-
-    try:
-        with socket.create_connection((host, port), timeout=TCP_TIMEOUT) as raw_sock:
-            if sec == "tls":
-                raw_sock.settimeout(TLS_TIMEOUT)
-                with TLS_CTX.wrap_socket(raw_sock, server_hostname=sni):
-                    return line, True
-            return line, True
-    except Exception:
-        return line, False
-
-
-# ---------- 4. Управление источниками и сохранением ----------
+# ---------- 3. Управление источниками и сохранением ----------
 
 def load_sources(filepath):
     trusted_urls = []
@@ -272,7 +243,7 @@ def run_trusted(trusted_urls):
     trusted_lines = []
     for line in trusted_raw:
         parsed = parse_config_line(line)
-        if line.startswith(CHECKED_SCHEMES) and not parsed:
+        if line.startswith(("vless://", "vmess://")) and not parsed:
             continue
         key = make_dedup_key(line, parsed)
         if key not in seen:
@@ -285,37 +256,11 @@ def run_trusted(trusted_urls):
 
 
 def run_checked(check_urls):
-    seen = set()
+    # Прямой сбор без дедупликации и без проверки TCP/TLS
     check_raw = fetch_batch(check_urls, CHECKED_SCHEMES, "CHECKED")
-    candidates = []
-    for line in check_raw:
-        parsed = parse_config_line(line)
-        if not parsed:
-            continue
-        key = make_dedup_key(line, parsed)
-        if key not in seen:
-            seen.add(key)
-            candidates.append((line, parsed))
-
     print("----", flush=True)
-    print(f"[CHECKED] Собрано строк: {len(check_raw)} | Уникальных кандидатов: {len(candidates)}", flush=True)
-
-    working_lines = []
-    if candidates:
-        print(f"Проверка доступности TCP + TLS ({len(candidates)} хостов, потоков {CHECK_CONCURRENCY})...", flush=True)
-        checked_count = 0
-        with ThreadPoolExecutor(max_workers=CHECK_CONCURRENCY) as executor:
-            futures = [executor.submit(check_socket_and_tls, c) for c in candidates]
-            for f in as_completed(futures):
-                line, is_alive = f.result()
-                checked_count += 1
-                if is_alive:
-                    working_lines.append(line)
-                if checked_count % 500 == 0 or checked_count == len(candidates):
-                    print(f"  Проверено: {checked_count}/{len(candidates)} | Доступно: {len(working_lines)}", flush=True)
-
-    print("----", flush=True)
-    save_subscription(working_lines, "checked")
+    print(f"[CHECKED] Собрано строк (без дедупликации и проверок): {len(check_raw)}", flush=True)
+    save_subscription(check_raw, "checked")
 
 
 def main():
@@ -324,7 +269,7 @@ def main():
         "--mode",
         choices=["trusted", "checked", "all"],
         default="all",
-        help="Режим сборки: trusted (только Igareck), checked (TCP/TLS проверка), all (оба)",
+        help="Режим сборки: trusted (Igareck с дедупом), checked (прямой сбор), all (оба)",
     )
     args = parser.parse_args()
 
