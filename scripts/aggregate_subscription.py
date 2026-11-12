@@ -4,12 +4,8 @@ import base64
 import ipaddress
 import json
 import os
-import queue
 import socket
 import ssl
-import subprocess
-import tempfile
-import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,17 +13,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 SOURCES_FILE = "subscription-sources.txt"
 OUT_DIR = "subscription"
 FETCH_TIMEOUT = 12
-
 MAX_LINES = 20000
 
-XRAY_BIN = os.environ.get("XRAY_BIN", "./xray")
-CHECK_CONCURRENCY = int(os.environ.get("CHECK_CONCURRENCY", "70"))
-PRE_FILTER_CONCURRENCY = 250
-TCP_PRE_TIMEOUT = 1.0
-TLS_PRE_TIMEOUT = 1.2
-
-TEST_URL = "https://www.gstatic.com/generate_204"
-CURL_TIMEOUT = 2.5
+# Параметры быстрой проверки доступности узла (TCP + TLS)
+CHECK_CONCURRENCY = 250
+TCP_TIMEOUT = 2.0
+TLS_TIMEOUT = 2.2
 
 TRUSTED_SCHEMES = (
     "vless://",
@@ -41,10 +32,6 @@ TRUSTED_SCHEMES = (
 )
 
 CHECKED_SCHEMES = ("vless://", "vmess://")
-
-PORT_POOL = queue.Queue()
-for _p in range(30000, 45000):
-    PORT_POOL.put(_p)
 
 
 # ---------- 1. Сбор и декодирование источников ----------
@@ -125,18 +112,9 @@ def parse_vless(line):
             "address": host,
             "port": int(port),
             "id": uuid,
-            "flow": q("flow"),
-            "network": q("type", "tcp") or "tcp",
             "security": q("security", "none") or "none",
             "sni": q("sni") or q("peer") or host,
-            "fp": q("fp") or "chrome",
-            "pbk": q("pbk"),
-            "sid": q("sid"),
-            "spx": q("spx"),
             "path": q("path", "/") or "/",
-            "host_header": q("host"),
-            "service_name": q("serviceName"),
-            "alpn": q("alpn"),
         }
     except Exception:
         return None
@@ -160,30 +138,19 @@ def parse_vmess(line):
         if not is_safe_address(host):
             return None
 
-        net = str(data.get("net") or "tcp").lower()
         tls_raw = str(data.get("tls") or "").lower()
         sec = "tls" if tls_raw in ("tls", "1", "true") else "none"
         sni = str(data.get("sni") or data.get("host") or host).strip()
-        host_header = str(data.get("host") or "").strip()
         path = str(data.get("path") or "/").strip() or "/"
-        aid = int(data.get("aid") or 0)
-        scy = str(data.get("scy") or "auto").strip() or "auto"
 
         return {
             "protocol": "vmess",
             "address": host,
             "port": port,
             "id": uuid,
-            "alterId": aid,
-            "security_vmess": scy,
-            "network": net,
             "security": sec,
             "sni": sni,
-            "fp": str(data.get("fp") or "chrome"),
             "path": path,
-            "host_header": host_header,
-            "service_name": path if net == "grpc" else "",
-            "alpn": str(data.get("alpn") or ""),
         }
     except Exception:
         return None
@@ -214,197 +181,38 @@ def make_dedup_key(line, parsed=None):
     return ("raw", line.split("#", 1)[0].strip())
 
 
-# ---------- 3. Быстрые сетевые фильтры ----------
-
-def wait_for_port(port, timeout=1.5):
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                return True
-        except Exception:
-            time.sleep(0.04)
-    return False
-
+# ---------- 3. Облегчённая проверка доступности (TCP + TLS Handshake) ----------
 
 TLS_CTX = ssl.create_default_context()
 TLS_CTX.check_hostname = False
 TLS_CTX.verify_mode = ssl.CERT_NONE
 
 
-def fast_socket_and_tls_check(item):
-    _, parsed = item
+def check_socket_and_tls(item):
+    """
+    Проверяет:
+    1. Открыт ли TCP-порт на сервере.
+    2. Если security == 'tls', проходит ли TLS Handshake с указанным SNI.
+    Reality и none засчитываются сразу после успешного TCP-соединения.
+    """
+    line, parsed = item
     host = parsed["address"]
     port = int(parsed["port"])
     sec = (parsed.get("security") or "none").lower()
     sni = parsed.get("sni") or host
 
     try:
-        with socket.create_connection((host, port), timeout=TCP_PRE_TIMEOUT) as raw_sock:
+        with socket.create_connection((host, port), timeout=TCP_TIMEOUT) as raw_sock:
             if sec == "tls":
-                raw_sock.settimeout(TLS_PRE_TIMEOUT)
+                raw_sock.settimeout(TLS_TIMEOUT)
                 with TLS_CTX.wrap_socket(raw_sock, server_hostname=sni):
-                    return item, True
-            return item, True
+                    return line, True
+            return line, True
     except Exception:
-        return item, False
+        return line, False
 
 
-# ---------- 4. Сборка JSON и проверка через Xray ----------
-
-def build_xray_config(p, socks_port):
-    proto = p["protocol"]
-    net = (p.get("network") or "tcp").lower()
-    sec = (p.get("security") or "none").lower()
-    sni = p.get("sni") or p.get("address")
-
-    stream = {
-        "network": net,
-        "security": sec,
-    }
-
-    if net == "ws":
-        ws_settings = {"path": p.get("path") or "/"}
-        host = p.get("host_header") or p.get("sni")
-        if host:
-            ws_settings["headers"] = {"Host": host}
-        stream["wsSettings"] = ws_settings
-
-    elif net == "grpc":
-        grpc_settings = {"multiMode": False}
-        if p.get("service_name"):
-            grpc_settings["serviceName"] = p["service_name"]
-        stream["grpcSettings"] = grpc_settings
-
-    elif net in ("h2", "http"):
-        http_settings = {"path": p.get("path") or "/"}
-        host = p.get("host_header") or p.get("sni")
-        if host:
-            http_settings["host"] = [host]
-        stream["httpSettings"] = http_settings
-
-    if sec == "tls":
-        tls_settings = {
-            "serverName": sni,
-            "allowInsecure": True,
-            "fingerprint": p.get("fp") or "chrome",
-        }
-        if p.get("alpn"):
-            tls_settings["alpn"] = [a.strip() for a in p["alpn"].split(",") if a.strip()]
-        stream["tlsSettings"] = tls_settings
-
-    elif sec == "reality":
-        reality_settings = {
-            "serverName": sni,
-            "fingerprint": p.get("fp") or "chrome",
-            "publicKey": p.get("pbk") or "",
-        }
-        if p.get("sid"):
-            reality_settings["shortId"] = p["sid"]
-        if p.get("spx"):
-            reality_settings["spiderX"] = p["spx"]
-        stream["realitySettings"] = reality_settings
-
-    if proto == "vless":
-        user = {
-            "id": p["id"],
-            "encryption": "none",
-        }
-        raw_flow = (p.get("flow") or "").strip()
-        if raw_flow and net == "tcp" and sec in ("tls", "reality"):
-            user["flow"] = raw_flow
-
-        outbound = {
-            "protocol": "vless",
-            "settings": {
-                "vnext": [{
-                    "address": p["address"],
-                    "port": int(p["port"]),
-                    "users": [user]
-                }]
-            },
-            "streamSettings": stream,
-        }
-    else:
-        outbound = {
-            "protocol": "vmess",
-            "settings": {
-                "vnext": [{
-                    "address": p["address"],
-                    "port": int(p["port"]),
-                    "users": [{
-                        "id": p["id"],
-                        "alterId": p.get("alterId", 0),
-                        "security": p.get("security_vmess", "auto"),
-                    }]
-                }]
-            },
-            "streamSettings": stream,
-        }
-
-    return {
-        "log": {"loglevel": "none"},
-        "inbounds": [{
-            "listen": "127.0.0.1",
-            "port": socks_port,
-            "protocol": "socks",
-            "settings": {"udp": False},
-        }],
-        "outbounds": [outbound],
-    }
-
-
-def check_config(parsed):
-    socks_port = PORT_POOL.get()
-    config = build_xray_config(parsed, socks_port)
-    config_path = None
-    proc = None
-    try:
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            json.dump(config, f)
-            config_path = f.name
-
-        proc = subprocess.Popen(
-            [XRAY_BIN, "run", "-c", config_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        if not wait_for_port(socks_port, timeout=1.5):
-            return False
-
-        result = subprocess.run(
-            [
-                "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                "--max-time", str(CURL_TIMEOUT),
-                "--socks5-hostname", f"127.0.0.1:{socks_port}",
-                TEST_URL,
-            ],
-            capture_output=True, text=True, timeout=CURL_TIMEOUT + 1.5,
-        )
-        return result.stdout.strip() in ("204", "200")
-    except Exception:
-        return False
-    finally:
-        if proc is not None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=1)
-            except Exception:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=1)
-                except Exception:
-                    pass
-        if config_path:
-            try:
-                os.remove(config_path)
-            except Exception:
-                pass
-        PORT_POOL.put(socks_port)
-
-
-# ---------- 5. Управление источниками и сохранением ----------
+# ---------- 4. Управление источниками и сохранением ----------
 
 def load_sources(filepath):
     trusted_urls = []
@@ -494,35 +302,17 @@ def run_checked(check_urls):
 
     working_lines = []
     if candidates:
-        print(f"Этап 1: Быстрый TCP + TLS pre-check ({len(candidates)} хостов)...", flush=True)
-        live_candidates = []
-        pre_checked = 0
-        with ThreadPoolExecutor(max_workers=PRE_FILTER_CONCURRENCY) as pre_exec:
-            futures = [pre_exec.submit(fast_socket_and_tls_check, c) for c in candidates]
-            for f in as_completed(futures):
-                item, is_alive = f.result()
-                pre_checked += 1
-                if is_alive:
-                    live_candidates.append(item)
-                if pre_checked % 1000 == 0 or pre_checked == len(candidates):
-                    print(f"  Pre-check: {pre_checked}/{len(candidates)} | Прошло дальше: {len(live_candidates)}", flush=True)
-
-        print(f"Живых хостов для Xray: {len(live_candidates)} из {len(candidates)}", flush=True)
-
-        print(f"Этап 2: Проверка через Xray (таймаут {CURL_TIMEOUT}с, потоков {CHECK_CONCURRENCY})...", flush=True)
-        xray_checked = 0
+        print(f"Проверка доступности TCP + TLS ({len(candidates)} хостов, потоков {CHECK_CONCURRENCY})...", flush=True)
+        checked_count = 0
         with ThreadPoolExecutor(max_workers=CHECK_CONCURRENCY) as executor:
-            future_map = {executor.submit(check_config, parsed): line for line, parsed in live_candidates}
-            for future in as_completed(future_map):
-                line = future_map[future]
-                xray_checked += 1
-                try:
-                    if future.result():
-                        working_lines.append(line)
-                except Exception:
-                    pass
-                if xray_checked % 50 == 0 or xray_checked == len(live_candidates):
-                    print(f"  Xray чек: {xray_checked}/{len(live_candidates)} | Рабочих: {len(working_lines)}", flush=True)
+            futures = [executor.submit(check_socket_and_tls, c) for c in candidates]
+            for f in as_completed(futures):
+                line, is_alive = f.result()
+                checked_count += 1
+                if is_alive:
+                    working_lines.append(line)
+                if checked_count % 500 == 0 or checked_count == len(candidates):
+                    print(f"  Проверено: {checked_count}/{len(candidates)} | Доступно: {len(working_lines)}", flush=True)
 
     print("----", flush=True)
     save_subscription(working_lines, "checked")
@@ -534,7 +324,7 @@ def main():
         "--mode",
         choices=["trusted", "checked", "all"],
         default="all",
-        help="Режим сборки: trusted (только Igareck), checked (проверка Xray), all (оба)",
+        help="Режим сборки: trusted (только Igareck), checked (TCP/TLS проверка), all (оба)",
     )
     args = parser.parse_args()
 
