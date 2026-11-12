@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: subscription-commit
+  cancel-in-progress: false
+
 jobs:
   build-checked:
     runs-on: ubuntu-latest
