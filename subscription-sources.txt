@@ -27,11 +27,17 @@
 # --- 4. Подписка skysph-dev с сайтаhttps://gist.github.com/skysph-dev/5b55986287442543485b30468db3eb65
 !https://gist.githubusercontent.com/skysph-dev/5b55986287442543485b30468db3eb65/raw/v2ray.txt
 
-# --- 5. https://gist.github.com/st0rer/52759ee3f68c3d4b2f2d53c307867471
+# --- 5. Подписка wtpn.pro (Happ/Throne), источник: https://wtpn.pro/ru/index.html
 !https://sub.wt419.site/wt/wtpn.pro
 
-# --- 6. подписка st0rer   https://gist.github.com/st0rer/52759ee3f68c3d4b2f2d53c307867471
+# --- 6. Подписка st0rer, источник: https://gist.github.com/st0rer/52759ee3f68c3d4b2f2d53c307867471
 !https://gist.githubusercontent.com/st0rer/52759ee3f68c3d4b2f2d53c307867471/raw/v2ray.txt
+
+# --- 7. Подписка Cepreu54 (Cergeu54), источник: https://github.com/Cepreu54
+# Попадают в отдельную подписку cepreu54_base64.txt с дедупликацией
+@https://raw.githubusercontent.com/Cepreu54/vless-clean/refs/heads/main/clean.txt
+@https://raw.githubusercontent.com/Cepreu54/vless-clean-2/refs/heads/main/clean.txt
+@https://raw.githubusercontent.com/Cepreu54/vless-clean-3/refs/heads/main/clean.txt
 
 # =====================================================================
 # ПРОВЕРЯЕМЫЕ ИСТОЧНИКИ (проходят полный цикл: TCP/TLS + Xray)
