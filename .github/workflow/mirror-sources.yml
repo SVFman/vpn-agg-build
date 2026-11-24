@@ -1,0 +1,43 @@
+name: Mirror GitVerse Sources
+
+on:
+  schedule:
+    # Раз в сутки: зеркала обновляются неспешно, с паузами между попытками.
+    - cron: "40 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Одна группа с основной сборкой: два workflow никогда не пушат одновременно
+# (git-auto-commit-action не делает git pull перед push).
+concurrency:
+  group: subscription-commit
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    # Дедлайн самого скрипта — 17 минут (MIRROR_DEADLINE_SECS); 25 даёт запас
+    # на чекаут и коммит и не даёт зависшему прогону съесть минуты Actions.
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Fetch gitverse lists (patient)
+        # Терпеливые ретраи с паузами под общим дедлайном 17 минут; при неудаче
+        # прежнее зеркало остаётся нетронутым, job не краснеет без причины.
+        run: python scripts/mirror_sources.py
+
+      - name: Commit mirrors
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: refresh gitverse mirrors"
+          file_pattern: "mirrors/*.txt"
