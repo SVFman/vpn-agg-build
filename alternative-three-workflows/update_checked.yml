@@ -1,0 +1,40 @@
+name: Update Checked Subscription
+
+on:
+  schedule:
+    # Минуты разнесены с другими workflow (0/20/40), чтобы не копиться в одной очереди.
+    - cron: "20 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Единая группа для всех workflow с коммитом подписки —
+# исключает гонки git push между разными job.
+concurrency:
+  group: subscription-commit
+  cancel-in-progress: false
+
+jobs:
+  build-checked:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Проверки TCP/TLS в этом режиме нет: прямой сбор источников без дедупликации.
+      - name: Aggregate checked sources
+        run: python scripts/aggregate_subscription.py --mode checked
+
+      - name: Commit updated Checked subscription
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Auto-update checked subscription"
+          file_pattern: "subscription/checked*.txt"
