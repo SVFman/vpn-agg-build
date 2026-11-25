@@ -15,3 +15,16 @@ utc,group,source,lines,hash,in_file,status
 2026-11-25T12:47:48Z,cepreu54,vless-clean/clean,63,29e1fcd7,26,ok
 2026-11-25T12:47:48Z,cepreu54,vless-clean-2/clean,522,ada9e08d,311,ok
 2026-11-25T12:47:48Z,cepreu54,vless-clean-3/clean,101,c2317199,14,ok
+2026-11-25T19:24:57Z,igareck,Vless-Reality-White-Lists-Rus-Mobile,6,0af9ad47,1,ok
+2026-11-25T19:24:57Z,igareck,WHITE-CIDR-RU-checked,0,,0,0
+2026-11-25T19:24:57Z,igareck,WHITE-CIDR-RU-all,6,0af9ad47,0,ok
+2026-11-25T19:24:57Z,igareck,BLACK_VLESS_RUS_mobile,146,5b431b93,74,ok
+2026-11-25T19:24:57Z,igareck,BLACK_VLESS_RUS,248,bab4e2ae,48,ok
+2026-11-25T19:24:57Z,igareck,BLACK_SS+All_RUS,49,0feee259,17,ok
+2026-11-25T19:24:57Z,igareck,BLACK_SS_WEAK_DPI_RUS,2,aee6bf9c,2,ok
+2026-11-25T19:24:57Z,igareck,vless_universal,125,1fd6eb7d,47,ok
+2026-11-25T19:24:57Z,igareck,vless_lite,125,1fd6eb7d,0,ok
+2026-11-25T19:24:57Z,igareck,skysph-dev/v2ray,19,22525ea4,19,ok
+2026-11-25T19:24:57Z,igareck,st0rer/v2ray,26,8ad214b2,26,ok
+2026-11-25T19:24:57Z,cepreu54,vless-clean/clean,57,adbc19a4,21,ok
+2026-11-25T19:24:57Z,cepreu54,vless-clean-3/clean,40,ef2d05a1,6,ok
