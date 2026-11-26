@@ -1,0 +1,82 @@
+name: Update VPN Subscriptions
+
+on:
+  schedule:
+    # Каждые 3 часа: один запуск собирает все подписки одним коммитом.
+    # Это исключает гонки пуша между workflow и экономит минуты Actions.
+    - cron: "20 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Режим сборки: trusted / cepreu54 / checked / all"
+        required: false
+        default: "all"
+      allow_shrink:
+        description: "Разрешить запись при деградации (результат ниже порога группы)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: subscription-commit
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Aggregate subscriptions
+        # Пользовательский ввод передаётся через env, а не интерполяцией в shell:
+        # значение не может вырваться из аргумента --mode (argparse choices отсеет мусор).
+        env:
+          MODE: ${{ inputs.mode || 'all' }}
+          ALLOW_SHRINK: ${{ inputs.allow_shrink }}
+          # Седьмая ревизия: журнал жизни источников; пустое значение STATS_LOG
+          # отключает журнал. Порог раздела сводки — через repo Variables.
+          STATS_LOG: stats/sources_log.csv
+          STATS_STALE_DAYS: ${{ vars.STATS_STALE_DAYS || '7' }}
+        run: |
+          ARGS=""
+          if [ "$ALLOW_SHRINK" = "true" ]; then ARGS="--allow-shrink"; fi
+          python scripts/aggregate_subscription.py --mode "$MODE" $ARGS
+
+      - name: Ensure cache directory exists
+        # git add падает (fatal: pathspec ... did not match), если указанного пути нет.
+        # Каталог и status.json создаются заранее, чтобы шаблон ниже всегда совпадал.
+        # Журнал источников создаётся с заголовком, если файла ещё нет (седьмая ревизия):
+        # даже при отключённом журнале файл-заготовка нужен для git add stats.
+        # Заголовок — 14 колонок (девятая ревизия: +src_ts, rejected, dup_inside);
+        # скрипт сам мигрирует старый файл (7 или 11 колонок) при первой же записи,
+        # существующие строки править не нужно.
+        run: |
+          mkdir -p mirrors
+          [ -f mirrors/status.json ] || echo '{}' > mirrors/status.json
+          mkdir -p stats
+          [ -f stats/sources_log.csv ] || echo 'utc,group,source,lines,hash,in_file,status,http,ms,bytes,uniq,src_ts,rejected,dup_inside' > stats/sources_log.csv
+
+      - name: Commit updated subscriptions
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: auto-update subscriptions"
+          file_pattern: "subscription/*.txt mirrors stats"
+
+      - name: Check published subscriptions (raw, no token)
+        # Восьмая ревизия: репозиторий публичный, подписки загружаются в приложения
+        # по raw-ссылкам без токена. Шаг проверяет, что только что закоммиченные
+        # файлы реально отдаются raw.githubusercontent.com и содержат конфиги.
+        # Информационный: job не краснит — raw-кэш GitHub может запаздывать
+        # на несколько минут, особенно для новых файлов.
+        run: python scripts/check_published.py
