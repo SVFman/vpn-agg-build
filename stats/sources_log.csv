@@ -113,3 +113,6 @@ utc,group,source,lines,hash,in_file,status,http,ms,bytes,uniq,src_ts,rejected,du
 2026-11-28T07:26:13Z,cepreu54,vless-clean/clean,68,727aa20c,23,ok,200,63,18218,22,,0,45
 2026-11-28T07:26:13Z,cepreu54,vless-clean-2/clean,996,77832c52,784,ok,200,157,301985,782,,5,211
 2026-11-28T07:26:13Z,cepreu54,vless-clean-3/clean,43,d1572424,5,ok,200,211,14260,5,,5,23
+2026-11-28T08:00:16Z,igareck,vless_universal,119,30b85767,40,ok,200,482,32829,0,,0,68
+2026-11-28T08:00:16Z,igareck,vless_lite,119,30b85767,0,ok,200,541,34095,0,,4,0
+2026-11-28T08:00:16Z,igareck,wtpn.pro,5,0f76ffe3,5,ok,200,657,3068,5,,0,0
