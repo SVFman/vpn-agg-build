@@ -1,0 +1,57 @@
+name: Weekly Sources Report
+
+on:
+  schedule:
+    # Понедельник 06:00 UTC = 09:00 МСК (план I9 из monitoring-ideas.txt).
+    # Отчёт информационный: данные за неполное окно помечаются в самом отчёте,
+    # поэтому первый запуск отработает ещё до накопления недельного журнала.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # Та же группа, что у основной сборки: коммиты отчёта и подписок
+  # не должны конфликтовать при совпадении по времени.
+  group: subscription-commit
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Полная история (правка 9.1, T-02): weekly_report.py берёт дату
+          # последней смены состава источников через git log -1 --
+          # subscription-sources.txt. При fetch-depth: 1 (по умолчанию у
+          # actions/checkout) видна только дата HEAD, и смена состава
+          # выглядит свежее, чем была.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build weekly report
+        # Скрипт читает журнал и НЕ трогает сборку подписок. Пустой или
+        # повреждённый журнал не роняет шаг (exit 0), проблемы попадают
+        # в раздел «Примечания» отчёта. Markdown дополнительно уходит
+        # в $GITHUB_STEP_SUMMARY изнутри скрипта.
+        run: python scripts/weekly_report.py
+
+      - name: Commit weekly report
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: weekly sources report"
+          # Каталог целиком вместо литеральных путей (правка 9.1, T-08):
+          # если отчёт не построился и файлов нет, git add по литеральным
+          # путям падает и краснит job. Каталог stats в репо есть (журнал
+          # источников), посторонних изменений шаг не подхватит — отчёт
+          # журнал не переписывает.
+          file_pattern: "stats"
